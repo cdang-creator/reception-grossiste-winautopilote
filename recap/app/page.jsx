@@ -131,25 +131,41 @@ function normalizeDoc(p, repaired) {
 
 class PasswordError extends Error {}
 
+/* Petite pause (utilisée pour patienter avant un réessai). */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function extractChunk(payload, password) {
-  const r = await fetch("/api/extract", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...payload, password: password || "" }),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (r.status === 401) throw new PasswordError("mot de passe");
-  if (!r.ok) throw new Error(j.error ? "Lecture impossible : " + j.error : "Lecture impossible.");
-  const raw = stripFences(j.text || "");
-  try {
-    return normalizeDoc(JSON.parse(raw), false);
-  } catch {
+  // Si l'IA est saturée (limite de débit / code 429), on patiente puis on
+  // réessaie le MÊME paquet — au lieu d'abandonner. Jusqu'à 6 tentatives.
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetch("/api/extract", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...payload, password: password || "" }),
+    });
+
+    if (r.status === 429 && attempt < 6) {
+      const ra = Number(r.headers.get("retry-after"));
+      // délai conseillé par le serveur, sinon attente progressive (1s, 2s, 4s… plafonnée à 60s)
+      const wait = ra ? ra * 1000 : Math.min(2 ** attempt * 1000, 60000);
+      await sleep(wait);
+      continue;
+    }
+
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) throw new PasswordError("mot de passe");
+    if (!r.ok) throw new Error(j.error ? "Lecture impossible : " + j.error : "Lecture impossible.");
+    const raw = stripFences(j.text || "");
     try {
-      return normalizeDoc(repairJson(raw), true);
+      return normalizeDoc(JSON.parse(raw), false);
     } catch {
-      throw new Error(
-        "Une partie d'un document n'a pas pu être lue (scan peu net). Rescannez cette page puis redéposez-la."
-      );
+      try {
+        return normalizeDoc(repairJson(raw), true);
+      } catch {
+        throw new Error(
+          "Une partie d'un document n'a pas pu être lue (scan peu net). Rescannez cette page puis redéposez-la."
+        );
+      }
     }
   }
 }
