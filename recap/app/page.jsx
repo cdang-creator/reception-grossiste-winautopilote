@@ -30,10 +30,9 @@ function downscaleImage(file, maxSide = 2200, quality = 0.85) {
   });
 }
 
-/* Taille max par paquet, volontairement basse (~1 Mo ≈ 2-3 pages scannées). Objectif :
-   que CHAQUE appel finisse sous le délai de 60 s de Vercel, même avec Opus (lent mais précis).
-   Si ça déborde encore, baisser à 700_000 ; si c'est trop lent, remonter prudemment. */
-const MAX_RAW = 1_000_000;
+/* Limite de corps de requête Vercel ≈ 4,5 Mo ; on vise ~3,3 Mo brut (≈4,4 Mo encodé). */
+const MAX_RAW = 2_900_000;
+const MAX_PAGES = 6;
 
 function uint8ToB64(u8) {
   let s = "";
@@ -65,7 +64,7 @@ async function splitPdfToChunks(arrayBuffer) {
   let cur = [];
   let curSize = 0;
   for (let i = 0; i < n; i++) {
-    if (cur.length && curSize + sizes[i] > MAX_RAW) {
+    if (cur.length && (curSize + sizes[i] > MAX_RAW || cur.length >= MAX_PAGES)) {
       groups.push(cur);
       cur = [];
       curSize = 0;
@@ -133,67 +132,36 @@ function normalizeDoc(p, repaired) {
 
 class PasswordError extends Error {}
 
-/* Petite pause (utilisée pour patienter avant un réessai). */
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/* Isole l'objet JSON même si le modèle a ajouté du texte autour ou des ``` */
-function extractJsonObject(text) {
-  let t = String(text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
-  const start = t.indexOf("{");
-  const end = t.lastIndexOf("}");
-  if (start !== -1 && end !== -1 && end > start) t = t.slice(start, end + 1);
-  return t;
-}
-
 async function extractChunk(payload, password) {
-  // Jusqu'à 6 tentatives. On patiente et on relance le MÊME paquet si :
-  //  - l'IA est saturée (429),
-  //  - le serveur tousse / dépasse les 60 s (erreur 5xx, timeout Vercel),
-  //  - la connexion est coupée,
-  //  - la réponse revient illisible (le modèle est aléatoire).
-  // On n'abandonne (message « scan peu net ») qu'après avoir vraiment épuisé les essais.
-  for (let attempt = 0; attempt < 6; attempt++) {
-    let r;
+  const r = await fetch("/api/extract", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...payload, password: password || "" }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401) throw new PasswordError("mot de passe");
+  if (!r.ok) {
+    const why =
+      j.error ||
+      (r.status === 413
+        ? "paquet trop volumineux (réduisez la résolution du scan)"
+        : r.status === 504 || r.status === 502 || r.status === 408
+        ? "délai de lecture dépassé sur ce paquet"
+        : "erreur serveur " + r.status);
+    throw new Error("Lecture impossible : " + why);
+  }
+  const raw = stripFences(j.text || "");
+  try {
+    return normalizeDoc(JSON.parse(raw), false);
+  } catch {
     try {
-      r = await fetch("/api/extract", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...payload, password: password || "" }),
-      });
+      return normalizeDoc(repairJson(raw), true);
     } catch {
-      // coupure réseau / requête avortée : on retente
-      await sleep(1500);
-      continue;
-    }
-
-    if (r.status === 429 || r.status >= 500) {
-      const ra = Number(r.headers.get("retry-after"));
-      // délai conseillé par le serveur, sinon attente progressive (1s, 2s, 4s… plafonnée à 60s)
-      const wait = ra ? ra * 1000 : Math.min(2 ** attempt * 1000, 60000);
-      await sleep(wait);
-      continue;
-    }
-
-    const j = await r.json().catch(() => ({}));
-    if (r.status === 401) throw new PasswordError("mot de passe");
-    if (!r.ok) throw new Error(j.error ? "Lecture impossible : " + j.error : "Lecture impossible.");
-
-    const raw = extractJsonObject(j.text || "");
-    try {
-      return normalizeDoc(JSON.parse(raw), false);
-    } catch {
-      try {
-        return normalizeDoc(repairJson(raw), true); // tolère une réponse coupée
-      } catch {
-        // Réponse inexploitable : on relance ce même paquet (sauf au dernier tour).
-        await sleep(800);
-        continue;
-      }
+      throw new Error(
+        "Une partie d'un document n'a pas pu être lue (scan peu net). Rescannez cette page puis redéposez-la."
+      );
     }
   }
-  throw new Error(
-    "Une partie d'un document n'a pas pu être lue (scan peu net). Rescannez cette page puis redéposez-la."
-  );
 }
 
 /* Lit un fichier entier : le découpe si besoin, renvoie un doc par paquet. */
@@ -202,7 +170,13 @@ async function extractFile(file, password, onChunk) {
   const docs = [];
   for (let i = 0; i < chunks.length; i++) {
     if (onChunk) onChunk(i + 1, chunks.length);
-    docs.push(await extractChunk(chunks[i], password));
+    try {
+      docs.push(await extractChunk(chunks[i], password));
+    } catch (e) {
+      if (e instanceof PasswordError) throw e;
+      await new Promise((res) => setTimeout(res, 800));
+      docs.push(await extractChunk(chunks[i], password)); // un essai de plus
+    }
   }
   return docs;
 }
