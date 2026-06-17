@@ -134,17 +134,27 @@ class PasswordError extends Error {}
 /* Petite pause (utilisée pour patienter avant un réessai). */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/* Isole l'objet JSON même si le modèle a ajouté du texte autour ou des ``` */
+function extractJsonObject(text) {
+  let t = String(text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) t = t.slice(start, end + 1);
+  return t;
+}
+
 async function extractChunk(payload, password) {
-  // Si l'IA est saturée (limite de débit / code 429), on patiente puis on
-  // réessaie le MÊME paquet — au lieu d'abandonner. Jusqu'à 6 tentatives.
-  for (let attempt = 0; ; attempt++) {
+  // Jusqu'à 6 tentatives. On patiente si l'IA est saturée (429), ET on relance
+  // aussi le même paquet si la réponse revient illisible (le modèle est aléatoire,
+  // un 2e essai passe le plus souvent) — au lieu d'abandonner tout de suite.
+  for (let attempt = 0; attempt < 6; attempt++) {
     const r = await fetch("/api/extract", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ ...payload, password: password || "" }),
     });
 
-    if (r.status === 429 && attempt < 6) {
+    if (r.status === 429) {
       const ra = Number(r.headers.get("retry-after"));
       // délai conseillé par le serveur, sinon attente progressive (1s, 2s, 4s… plafonnée à 60s)
       const wait = ra ? ra * 1000 : Math.min(2 ** attempt * 1000, 60000);
@@ -155,19 +165,23 @@ async function extractChunk(payload, password) {
     const j = await r.json().catch(() => ({}));
     if (r.status === 401) throw new PasswordError("mot de passe");
     if (!r.ok) throw new Error(j.error ? "Lecture impossible : " + j.error : "Lecture impossible.");
-    const raw = stripFences(j.text || "");
+
+    const raw = extractJsonObject(j.text || "");
     try {
       return normalizeDoc(JSON.parse(raw), false);
     } catch {
       try {
-        return normalizeDoc(repairJson(raw), true);
+        return normalizeDoc(repairJson(raw), true); // tolère une réponse coupée
       } catch {
-        throw new Error(
-          "Une partie d'un document n'a pas pu être lue (scan peu net). Rescannez cette page puis redéposez-la."
-        );
+        // Réponse inexploitable : on relance ce même paquet (sauf au dernier tour).
+        await sleep(800);
+        continue;
       }
     }
   }
+  throw new Error(
+    "Une partie d'un document n'a pas pu être lue (scan peu net). Rescannez cette page puis redéposez-la."
+  );
 }
 
 /* Lit un fichier entier : le découpe si besoin, renvoie un doc par paquet. */
