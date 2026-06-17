@@ -30,8 +30,10 @@ function downscaleImage(file, maxSide = 2200, quality = 0.85) {
   });
 }
 
-/* Limite de corps de requête Vercel ≈ 4,5 Mo ; on vise ~3,3 Mo brut (≈4,4 Mo encodé). */
-const MAX_RAW = 3_300_000;
+/* Taille max par paquet, volontairement basse (~1 Mo ≈ 2-3 pages scannées). Objectif :
+   que CHAQUE appel finisse sous le délai de 60 s de Vercel, même avec Opus (lent mais précis).
+   Si ça déborde encore, baisser à 700_000 ; si c'est trop lent, remonter prudemment. */
+const MAX_RAW = 1_000_000;
 
 function uint8ToB64(u8) {
   let s = "";
@@ -144,17 +146,27 @@ function extractJsonObject(text) {
 }
 
 async function extractChunk(payload, password) {
-  // Jusqu'à 6 tentatives. On patiente si l'IA est saturée (429), ET on relance
-  // aussi le même paquet si la réponse revient illisible (le modèle est aléatoire,
-  // un 2e essai passe le plus souvent) — au lieu d'abandonner tout de suite.
+  // Jusqu'à 6 tentatives. On patiente et on relance le MÊME paquet si :
+  //  - l'IA est saturée (429),
+  //  - le serveur tousse / dépasse les 60 s (erreur 5xx, timeout Vercel),
+  //  - la connexion est coupée,
+  //  - la réponse revient illisible (le modèle est aléatoire).
+  // On n'abandonne (message « scan peu net ») qu'après avoir vraiment épuisé les essais.
   for (let attempt = 0; attempt < 6; attempt++) {
-    const r = await fetch("/api/extract", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...payload, password: password || "" }),
-    });
+    let r;
+    try {
+      r = await fetch("/api/extract", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...payload, password: password || "" }),
+      });
+    } catch {
+      // coupure réseau / requête avortée : on retente
+      await sleep(1500);
+      continue;
+    }
 
-    if (r.status === 429) {
+    if (r.status === 429 || r.status >= 500) {
       const ra = Number(r.headers.get("retry-after"));
       // délai conseillé par le serveur, sinon attente progressive (1s, 2s, 4s… plafonnée à 60s)
       const wait = ra ? ra * 1000 : Math.min(2 ** attempt * 1000, 60000);
