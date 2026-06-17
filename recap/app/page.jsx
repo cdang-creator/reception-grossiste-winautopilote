@@ -6,15 +6,6 @@ import React, { useState, useRef } from "react";
 /*  Préparation des fichiers                                           */
 /* ------------------------------------------------------------------ */
 
-function fileToBase64(file) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(String(r.result).split(",")[1]);
-    r.onerror = () => rej(new Error("Lecture du fichier impossible"));
-    r.readAsDataURL(file);
-  });
-}
-
 /* Réduit les images trop lourdes pour rester sous la limite de requête (4,5 Mo) */
 function downscaleImage(file, maxSide = 2200, quality = 0.85) {
   return new Promise((res, rej) => {
@@ -39,19 +30,75 @@ function downscaleImage(file, maxSide = 2200, quality = 0.85) {
   });
 }
 
-async function prepareFile(file) {
+/* Limite de corps de requête Vercel ≈ 4,5 Mo ; on vise ~3,3 Mo brut (≈4,4 Mo encodé). */
+const MAX_RAW = 3_300_000;
+
+function uint8ToB64(u8) {
+  let s = "";
+  const CH = 0x8000;
+  for (let i = 0; i < u8.length; i += CH) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+  }
+  return btoa(s);
+}
+
+/* Découpe un gros PDF en paquets de pages, chacun sous la limite. */
+async function splitPdfToChunks(arrayBuffer) {
+  const { PDFDocument } = await import("pdf-lib");
+  const src = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
+  const n = src.getPageCount();
+  if (!n) throw new Error("PDF vide ou illisible.");
+
+  // 1) taille individuelle de chaque page
+  const sizes = [];
+  for (let i = 0; i < n; i++) {
+    const one = await PDFDocument.create();
+    const [pg] = await one.copyPages(src, [i]);
+    one.addPage(pg);
+    sizes.push((await one.save({ useObjectStreams: true })).length);
+  }
+
+  // 2) regroupement glouton sous la limite (la taille combinée ≤ somme des pages)
+  const groups = [];
+  let cur = [];
+  let curSize = 0;
+  for (let i = 0; i < n; i++) {
+    if (cur.length && curSize + sizes[i] > MAX_RAW) {
+      groups.push(cur);
+      cur = [];
+      curSize = 0;
+    }
+    cur.push(i);
+    curSize += sizes[i];
+  }
+  if (cur.length) groups.push(cur);
+
+  // 3) sérialisation de chaque paquet
+  const chunks = [];
+  for (const g of groups) {
+    const out = await PDFDocument.create();
+    const cp = await out.copyPages(src, g);
+    cp.forEach((p) => out.addPage(p));
+    chunks.push(uint8ToB64(await out.save({ useObjectStreams: true })));
+  }
+  return chunks;
+}
+
+/* Renvoie une liste de charges utiles {data, mediaType, isPdf}, chacune sous la limite. */
+async function prepareChunks(file) {
   const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
   if (isPdf) {
-    if (file.size > 4 * 1024 * 1024)
-      throw new Error(
-        "« " +
-          file.name +
-          " » dépasse 4 Mo. Scannez-le en noir et blanc / résolution plus basse, ou en deux fichiers."
-      );
-    return { data: await fileToBase64(file), mediaType: "application/pdf", isPdf: true };
+    const buf = await file.arrayBuffer();
+    if (buf.byteLength <= MAX_RAW) {
+      return [
+        { data: uint8ToB64(new Uint8Array(buf)), mediaType: "application/pdf", isPdf: true },
+      ];
+    }
+    const parts = await splitPdfToChunks(buf);
+    return parts.map((d) => ({ data: d, mediaType: "application/pdf", isPdf: true }));
   }
   const { data, mediaType } = await downscaleImage(file);
-  return { data, mediaType, isPdf: false };
+  return [{ data, mediaType, isPdf: false }];
 }
 
 /* ------------------------------------------------------------------ */
@@ -84,12 +131,11 @@ function normalizeDoc(p, repaired) {
 
 class PasswordError extends Error {}
 
-async function extractDoc(file, password) {
-  const prepared = await prepareFile(file);
+async function extractChunk(payload, password) {
   const r = await fetch("/api/extract", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...prepared, password: password || "" }),
+    body: JSON.stringify({ ...payload, password: password || "" }),
   });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401) throw new PasswordError("mot de passe");
@@ -102,12 +148,21 @@ async function extractDoc(file, password) {
       return normalizeDoc(repairJson(raw), true);
     } catch {
       throw new Error(
-        "Lecture impossible pour « " +
-          file.name +
-          " » (document trop long ou scan peu net). Scannez-le en deux fichiers et redéposez-les."
+        "Une partie d'un document n'a pas pu être lue (scan peu net). Rescannez cette page puis redéposez-la."
       );
     }
   }
+}
+
+/* Lit un fichier entier : le découpe si besoin, renvoie un doc par paquet. */
+async function extractFile(file, password, onChunk) {
+  const chunks = await prepareChunks(file);
+  const docs = [];
+  for (let i = 0; i < chunks.length; i++) {
+    if (onChunk) onChunk(i + 1, chunks.length);
+    docs.push(await extractChunk(chunks[i], password));
+  }
+  return docs;
 }
 
 /* ------------------------------------------------------------------ */
@@ -123,6 +178,20 @@ const eur = (n) =>
   }) + " €";
 const qty = (n) =>
   Number.isInteger(n) ? String(n) : n.toLocaleString("fr-FR", { maximumFractionDigits: 3 });
+
+const parseFr = (v) => {
+  const n = parseFloat(String(v).replace(/\s/g, "").replace(",", "."));
+  return isFinite(n) ? n : 0;
+};
+const fmtEdit = (n) =>
+  n == null ? "" : (Math.round(n * 100) / 100).toString().replace(".", ",");
+const lineMontant = (l) =>
+  typeof l.montant_ht === "number"
+    ? l.montant_ht
+    : typeof l.pu_ht === "number"
+    ? l.pu_ht * num(l.qte)
+    : 0;
+const docSum = (doc) => (doc.lignes || []).reduce((s, l) => s + lineMontant(l), 0);
 
 function aggregate(docs) {
   const map = new Map();
@@ -223,6 +292,8 @@ export default function Page() {
   const [error, setError] = useState("");
   const [showDetail, setShowDetail] = useState(false);
   const [truncated, setTruncated] = useState(false);
+  const [blDocs, setBlDocs] = useState(null);
+  const [wpDocs, setWpDocs] = useState(null);
   const [password, setPassword] = useState("");
   const [needPassword, setNeedPassword] = useState(false);
 
@@ -245,20 +316,42 @@ export default function Page() {
     try {
       const blDocs = [];
       for (let i = 0; i < blFiles.length; i++) {
-        setProgress(`Lecture des BL CERP — ${i + 1}/${blFiles.length}`);
-        blDocs.push(await extractDoc(blFiles[i], password));
+        const part = blFiles.length > 1 ? ` (${i + 1}/${blFiles.length})` : "";
+        const got = await extractFile(blFiles[i], password, (c, t) =>
+          setProgress(
+            t > 1
+              ? `Lecture des BL CERP${part} — paquet ${c}/${t}`
+              : `Lecture des BL CERP${part}`
+          )
+        );
+        blDocs.push(...got);
       }
       const wpDocs = [];
       for (let i = 0; i < wpFiles.length; i++) {
-        setProgress(`Lecture de la réception Winpharma — ${i + 1}/${wpFiles.length}`);
-        wpDocs.push(await extractDoc(wpFiles[i], password));
+        const part = wpFiles.length > 1 ? ` (${i + 1}/${wpFiles.length})` : "";
+        const got = await extractFile(wpFiles[i], password, (c, t) =>
+          setProgress(
+            t > 1
+              ? `Lecture Winpharma${part} — paquet ${c}/${t}`
+              : `Lecture de la réception Winpharma${part}`
+          )
+        );
+        wpDocs.push(...got);
       }
       setProgress("Comparaison…");
+      setBlDocs(blDocs);
+      setWpDocs(wpDocs);
       const blAgg = aggregate(blDocs);
       const wpAgg = aggregate(wpDocs);
       setExtractions({ bl: blAgg, wp: wpAgg });
       setTruncated([...blDocs, ...wpDocs].some((d) => d._repaired));
       setResult(reconcile(blAgg, wpAgg));
+      const mismatch =
+        (blAgg.statedTotal != null &&
+          Math.abs(blAgg.statedTotal - blAgg.sumLines) >= 0.02) ||
+        (wpAgg.statedTotal != null &&
+          Math.abs(wpAgg.statedTotal - wpAgg.sumLines) >= 0.02);
+      setShowDetail(mismatch);
       setNeedPassword(false);
       setStatus("done");
     } catch (e) {
@@ -279,10 +372,111 @@ export default function Page() {
     setExtractions(null);
     setError("");
     setTruncated(false);
+    setBlDocs(null);
+    setWpDocs(null);
+    setShowDetail(false);
     setStatus("idle");
   };
 
+  const recompute = (bdocs, wdocs) => {
+    const blAgg = aggregate(bdocs);
+    const wpAgg = aggregate(wdocs);
+    setExtractions({ bl: blAgg, wp: wpAgg });
+    setResult(reconcile(blAgg, wpAgg));
+  };
+
+  const editLine = (side, di, li, field, value) => {
+    const v = parseFr(value);
+    const src = side === "bl" ? blDocs : wpDocs;
+    if (!src) return;
+    const docs = src.map((d, i) =>
+      i !== di
+        ? d
+        : { ...d, lignes: d.lignes.map((l, j) => (j === li ? { ...l, [field]: v } : l)) }
+    );
+    if (side === "bl") {
+      setBlDocs(docs);
+      recompute(docs, wpDocs);
+    } else {
+      setWpDocs(docs);
+      recompute(blDocs, docs);
+    }
+  };
+
   const canRun = blFiles.length > 0 && wpFiles.length > 0 && status !== "reading";
+
+  const issues = result
+    ? [
+        {
+          key: "qty",
+          title: "Écarts de quantité",
+          action:
+            "Manque livré → réclamer un avoir à CERP. Surplus reçu → vérifier et signaler.",
+          impact: result.qtyEcarts.reduce(
+            (s, r) => s + Math.abs((r.qteWP - r.qteBL) * (r.puBL || r.puWP)),
+            0
+          ),
+          rows: result.qtyEcarts,
+          cols: [
+            ["Produit", (r) => r.designation, "left"],
+            ["Code", (r) => r.code || "—", "left mono"],
+            ["Qté BL", (r) => qty(r.qteBL), "num"],
+            ["Qté reçue", (r) => qty(r.qteWP), "num"],
+            ["Écart", (r) => qty(r.qteWP - r.qteBL), "num strong"],
+            ["Impact €", (r) => eur((r.qteWP - r.qteBL) * (r.puBL || r.puWP)), "num"],
+          ],
+        },
+        {
+          key: "price",
+          title: "Écarts de prix",
+          action:
+            "Prix facturé ≠ prix attendu → corriger le tarif / la remise dans Winpharma. Sinon ça se répète à chaque commande.",
+          impact: result.priceEcarts.reduce(
+            (s, r) => s + Math.abs(r.qteWP * (r.puWP - r.puBL)),
+            0
+          ),
+          rows: result.priceEcarts,
+          cols: [
+            ["Produit", (r) => r.designation, "left"],
+            ["Code", (r) => r.code || "—", "left mono"],
+            ["Prix BL", (r) => eur(r.puBL), "num"],
+            ["Prix Winpharma", (r) => eur(r.puWP), "num"],
+            ["Écart unit.", (r) => eur(r.puWP - r.puBL), "num strong"],
+            ["Impact €", (r) => eur(r.qteWP * (r.puWP - r.puBL)), "num"],
+          ],
+        },
+        {
+          key: "blonly",
+          title: "Présent au BL, absent de la réception",
+          action:
+            "Sur le BL mais pas enregistré reçu → vérifier physiquement ; réclamer à CERP si non livré.",
+          impact: result.blOnly.reduce((s, r) => s + Math.abs(r.montantBL), 0),
+          rows: result.blOnly,
+          cols: [
+            ["Produit", (r) => r.designation, "left"],
+            ["Code", (r) => r.code || "—", "left mono"],
+            ["Qté BL", (r) => qty(r.qteBL), "num"],
+            ["Montant BL", (r) => eur(r.montantBL), "num strong"],
+          ],
+        },
+        {
+          key: "wponly",
+          title: "Reçu mais absent du BL",
+          action:
+            "Reçu sans BL → vérifier le colis. Présent = un BL à scanner. Absent = corriger la réception dans Winpharma.",
+          impact: result.wpOnly.reduce((s, r) => s + Math.abs(r.montantWP), 0),
+          rows: result.wpOnly,
+          cols: [
+            ["Produit", (r) => r.designation, "left"],
+            ["Code", (r) => r.code || "—", "left mono"],
+            ["Qté reçue", (r) => qty(r.qteWP), "num"],
+            ["Montant", (r) => eur(r.montantWP), "num strong"],
+          ],
+        },
+      ]
+        .filter((i) => i.rows.length > 0)
+        .sort((a, b) => b.impact - a.impact)
+    : [];
 
   return (
     <div className="rcp-root">
@@ -337,60 +531,74 @@ export default function Page() {
             Réinitialiser
           </button>
         )}
-        <span className="rcp-privacy">
-          Les documents sont lus le temps de l'analyse. Rien n'est conservé.
-        </span>
+        <span className="rcp-privacy">Lecture par l'IA, le temps de l'analyse.</span>
       </div>
 
       {status === "reading" && (
-        <div className="rcp-loading">
-          <span className="rcp-spin" />
+        <div className="rcp-loading" role="status" aria-live="polite">
+          <span className="rcp-spin" aria-hidden="true" />
           {progress}
         </div>
       )}
 
-      {error && <div className="rcp-error">{error}</div>}
+      {error && (
+        <div className="rcp-error" role="alert">
+          {error}
+        </div>
+      )}
 
       {result && (
         <div className="rcp-result">
           {result.pricesMissing ? (
-            <div className="rcp-verdict warn">
-              <div className="rcp-verdict-main">Prix non détectés sur les documents</div>
-              <div className="rcp-verdict-sub">
-                Impossible de comparer les montants. Vérifiez que les scans montrent bien les prix,
-                ou comparez en quantité dans le détail ci-dessous.
+            <div className="rcp-verdict warn" role="status">
+              <span className="rcp-verdict-icon" aria-hidden="true">!</span>
+              <div className="rcp-verdict-body">
+                <div className="rcp-verdict-main">Prix non détectés</div>
+                <div className="rcp-verdict-sub">
+                  Impossible de comparer les montants. Vérifiez que les scans montrent les prix, ou
+                  regardez les quantités dans le détail ci-dessous.
+                </div>
               </div>
             </div>
           ) : result.concordance ? (
-            <div className="rcp-verdict ok">
-              <div className="rcp-verdict-main">Les montants concordent</div>
-              <div className="rcp-verdict-sub">
-                Total BL <b className="num">{eur(result.totalBL)}</b> · Réception Winpharma{" "}
-                <b className="num">{eur(result.totalWP)}</b>
+            <div className="rcp-verdict ok" role="status">
+              <span className="rcp-verdict-icon" aria-hidden="true">✓</span>
+              <div className="rcp-verdict-body">
+                <div className="rcp-verdict-main">Les montants concordent</div>
+                <div className="rcp-verdict-sub">
+                  Rien à faire. Total BL <b className="num">{eur(result.totalBL)}</b> · Reçu Winpharma{" "}
+                  <b className="num">{eur(result.totalWP)}</b>
+                </div>
               </div>
             </div>
           ) : (
-            <div className="rcp-verdict bad">
-              <div className="rcp-verdict-main">
-                Écart de <span className="num">{eur(Math.abs(result.ecart))}</span>
-              </div>
-              <div className="rcp-verdict-sub">
-                Total BL <b className="num">{eur(result.totalBL)}</b> · Réception Winpharma{" "}
-                <b className="num">{eur(result.totalWP)}</b>
-              </div>
-              <div className="rcp-chips">
-                <span className="rcp-chip">
-                  dont quantité <b className="num">{eur(result.partQte)}</b>
-                </span>
-                <span className="rcp-chip">
-                  dont prix <b className="num">{eur(result.partPrix)}</b>
-                </span>
+            <div className="rcp-verdict bad" role="status">
+              <span className="rcp-verdict-icon" aria-hidden="true">✗</span>
+              <div className="rcp-verdict-body">
+                <div className="rcp-verdict-label">Écart à traiter</div>
+                <div className="rcp-verdict-amount num">{eur(Math.abs(result.ecart))}</div>
+                <div className="rcp-verdict-sub">
+                  Total BL <b className="num">{eur(result.totalBL)}</b> · Reçu Winpharma{" "}
+                  <b className="num">{eur(result.totalWP)}</b>
+                  {" — "}
+                  {result.ecart > 0
+                    ? "Winpharma supérieur (ce n'est pas un manquant CERP)"
+                    : "BL supérieur (manque côté reçu)"}
+                </div>
+                <div className="rcp-chips">
+                  <span className="rcp-chip">
+                    dont quantité <b className="num">{eur(result.partQte)}</b>
+                  </span>
+                  <span className="rcp-chip">
+                    dont prix <b className="num">{eur(result.partPrix)}</b>
+                  </span>
+                </div>
               </div>
             </div>
           )}
 
           {truncated && (
-            <div className="rcp-integrity">
+            <div className="rcp-integrity" role="alert">
               ⚠ Un document était trop long : la lecture a été tronquée et des lignes ont pu être
               perdues. Le total peut être incomplet — vérifiez le détail, ou scannez le BL en deux
               fichiers et relancez.
@@ -400,66 +608,37 @@ export default function Page() {
           <IntegrityCheck side="BL CERP" agg={extractions.bl} />
           <IntegrityCheck side="Réception Winpharma" agg={extractions.wp} />
 
-          {!result.concordance && !result.pricesMissing && (
-            <>
-              <EcartTable
-                title="Écarts de quantité"
-                empty="Aucun écart de quantité."
-                rows={result.qtyEcarts}
-                cols={[
-                  ["Produit", (r) => r.designation, "left"],
-                  ["Code", (r) => r.code || "—", "left mono"],
-                  ["Qté BL", (r) => qty(r.qteBL), "num"],
-                  ["Qté reçue", (r) => qty(r.qteWP), "num"],
-                  ["Écart", (r) => qty(r.qteWP - r.qteBL), "num strong"],
-                  ["Impact €", (r) => eur((r.qteWP - r.qteBL) * (r.puBL || r.puWP)), "num"],
-                ]}
-              />
-              <EcartTable
-                title="Écarts de prix"
-                empty="Aucun écart de prix."
-                rows={result.priceEcarts}
-                cols={[
-                  ["Produit", (r) => r.designation, "left"],
-                  ["Code", (r) => r.code || "—", "left mono"],
-                  ["Prix BL", (r) => eur(r.puBL), "num"],
-                  ["Prix Winpharma", (r) => eur(r.puWP), "num"],
-                  ["Écart unit.", (r) => eur(r.puWP - r.puBL), "num strong"],
-                  ["Impact €", (r) => eur(r.qteWP * (r.puWP - r.puBL)), "num"],
-                ]}
-              />
-              <EcartTable
-                title="Présent au BL, absent de la réception"
-                empty="Aucun."
-                rows={result.blOnly}
-                cols={[
-                  ["Produit", (r) => r.designation, "left"],
-                  ["Code", (r) => r.code || "—", "left mono"],
-                  ["Qté BL", (r) => qty(r.qteBL), "num"],
-                  ["Montant BL", (r) => eur(r.montantBL), "num strong"],
-                ]}
-              />
-              <EcartTable
-                title="Reçu mais absent du BL"
-                empty="Aucun."
-                rows={result.wpOnly}
-                cols={[
-                  ["Produit", (r) => r.designation, "left"],
-                  ["Code", (r) => r.code || "—", "left mono"],
-                  ["Qté reçue", (r) => qty(r.qteWP), "num"],
-                  ["Montant", (r) => eur(r.montantWP), "num strong"],
-                ]}
-              />
-            </>
+          {issues.length > 0 && (
+            <div className="rcp-section-head">À traiter — classé par impact</div>
           )}
+          {issues.map((iss) => (
+            <EcartTable
+              key={iss.key}
+              title={iss.title}
+              action={iss.action}
+              impact={iss.impact}
+              rows={iss.rows}
+              cols={iss.cols}
+            />
+          ))}
 
           <button className="rcp-detail-toggle" onClick={() => setShowDetail((s) => !s)}>
             {showDetail ? "Masquer" : "Voir"} le détail des lignes lues
           </button>
-          {showDetail && (
+          {showDetail && blDocs && wpDocs && (
             <div className="rcp-detail">
-              <DetailTable title="Lignes lues — BL CERP" agg={extractions.bl} />
-              <DetailTable title="Lignes lues — Réception Winpharma" agg={extractions.wp} />
+              <p className="rcp-edit-hint">
+                Une valeur mal lue ? Clique le chiffre, tape le bon (la virgule marche), sors du
+                champ : le total et la comparaison se recalculent. Vise « lignes = total » sur
+                chaque document.
+              </p>
+              <EditableDetail side="bl" label="BL CERP" docs={blDocs} onEdit={editLine} />
+              <EditableDetail
+                side="wp"
+                label="Réception Winpharma"
+                docs={wpDocs}
+                onEdit={editLine}
+              />
             </div>
           )}
         </div>
@@ -480,6 +659,15 @@ function DropZone({ label, hint, files, onAdd, onRemove, tone }) {
   return (
     <div
       className={"rcp-zone " + tone + (over ? " over" : "")}
+      role="button"
+      tabIndex={0}
+      aria-label={label + " — ajouter des fichiers"}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          inputRef.current && inputRef.current.click();
+        }
+      }}
       onDragOver={(e) => {
         e.preventDefault();
         setOver(true);
@@ -502,7 +690,7 @@ function DropZone({ label, hint, files, onAdd, onRemove, tone }) {
       />
       <div className="rcp-zone-label">{label}</div>
       <div className="rcp-zone-hint">{hint}</div>
-      <div className="rcp-zone-cta">Glissez vos fichiers ici ou cliquez</div>
+      <div className="rcp-zone-cta">Cliquez ou glissez vos fichiers</div>
       {files.length > 0 && (
         <ul className="rcp-files" onClick={(e) => e.stopPropagation()}>
           {files.map((f, i) => (
@@ -524,7 +712,7 @@ function IntegrityCheck({ side, agg }) {
   const diff = agg.statedTotal - agg.sumLines;
   if (Math.abs(diff) < 0.02) return null;
   return (
-    <div className="rcp-integrity">
+    <div className="rcp-integrity" role="alert">
       ⚠ {side} : le total imprimé (<span className="num">{eur(agg.statedTotal)}</span>) ne colle pas
       à la somme des lignes lues (<span className="num">{eur(agg.sumLines)}</span>). Une ligne a
       peut-être été mal lue — vérifiez le détail avant de conclure.
@@ -532,87 +720,129 @@ function IntegrityCheck({ side, agg }) {
   );
 }
 
-function EcartTable({ title, rows, cols, empty }) {
+function EcartTable({ title, rows, cols, action, impact }) {
+  if (!rows || rows.length === 0) return null;
   return (
-    <section className="rcp-table-block">
-      <h3 className="rcp-table-title">
-        {title} <span className="rcp-count">{rows.length}</span>
-      </h3>
-      {rows.length === 0 ? (
-        <p className="rcp-empty">{empty}</p>
-      ) : (
-        <div className="rcp-table-wrap">
-          <table className="rcp-table">
-            <thead>
-              <tr>
-                {cols.map((c, i) => (
-                  <th key={i} className={c[2].includes("num") ? "ta-r" : "ta-l"}>
-                    {c[0]}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r, ri) => (
-                <tr key={ri}>
-                  {cols.map((c, ci) => (
-                    <td
-                      key={ci}
-                      className={
-                        (c[2].includes("num") ? "ta-r num " : "ta-l ") +
-                        (c[2].includes("mono") ? "mono " : "") +
-                        (c[2].includes("strong") ? "strong" : "")
-                      }
-                    >
-                      {c[1](r)}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function DetailTable({ title, agg }) {
-  const rows = [...agg.map.values()];
-  return (
-    <section className="rcp-table-block">
-      <h3 className="rcp-table-title">{title}</h3>
+    <section className="rcp-issue">
+      <div className="rcp-issue-head">
+        <h3 className="rcp-issue-title">
+          {title} <span className="rcp-count">{rows.length}</span>
+        </h3>
+        {typeof impact === "number" && (
+          <span className="rcp-impact num">{eur(Math.abs(impact))}</span>
+        )}
+      </div>
+      {action && <p className="rcp-action">{action}</p>}
       <div className="rcp-table-wrap">
-        <table className="rcp-table small">
+        <table className="rcp-table">
           <thead>
             <tr>
-              <th className="ta-l">Produit</th>
-              <th className="ta-l">Code</th>
-              <th className="ta-r">Qté</th>
-              <th className="ta-r">PU HT</th>
-              <th className="ta-r">Montant</th>
+              {cols.map((c, i) => (
+                <th key={i} scope="col" className={c[2].includes("num") ? "ta-r" : "ta-l"}>
+                  {c[0]}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
-            {rows.map((r, i) => (
-              <tr key={i}>
-                <td className="ta-l">{r.designation}</td>
-                <td className="ta-l mono">{r.code || "—"}</td>
-                <td className="ta-r num">{qty(r.qte)}</td>
-                <td className="ta-r num">{r.puKnown ? eur(r.pu) : "—"}</td>
-                <td className="ta-r num">{r.puKnown ? eur(r.montant) : "—"}</td>
+            {rows.map((r, ri) => (
+              <tr key={ri}>
+                {cols.map((c, ci) => (
+                  <td
+                    key={ci}
+                    className={
+                      (c[2].includes("num") ? "ta-r num " : "ta-l ") +
+                      (c[2].includes("mono") ? "mono " : "") +
+                      (c[2].includes("strong") ? "strong" : "")
+                    }
+                  >
+                    {c[1](r)}
+                  </td>
+                ))}
               </tr>
             ))}
-            <tr className="rcp-total-row">
-              <td className="ta-l strong" colSpan={4}>
-                Total
-              </td>
-              <td className="ta-r num strong">{eur(agg.sumLines)}</td>
-            </tr>
           </tbody>
         </table>
       </div>
     </section>
+  );
+}
+
+function EditableDetail({ side, label, docs, onEdit }) {
+  return (
+    <>
+      {docs.map((doc, di) => {
+        const sum = docSum(doc);
+        const stated = typeof doc.total_ht === "number" ? doc.total_ht : null;
+        const gap = stated != null ? stated - sum : null;
+        const matched = gap != null && Math.abs(gap) < 0.02;
+        return (
+          <section className="rcp-issue" key={di}>
+            <div className="rcp-issue-head">
+              <h3 className="rcp-issue-title">
+                {label}
+                {docs.length > 1 ? " " + (di + 1) : ""}
+                {doc._repaired && <span className="rcp-tag">lecture tronquée</span>}
+              </h3>
+              {stated != null && (
+                <span className={matched ? "rcp-doc-ok" : "rcp-doc-gap"}>
+                  {matched ? "✓ lignes = total" : "écart " + eur(gap)}
+                </span>
+              )}
+            </div>
+            <div className="rcp-table-wrap">
+              <table className="rcp-table small">
+                <thead>
+                  <tr>
+                    <th scope="col" className="ta-l">Produit</th>
+                    <th scope="col" className="ta-l">Code</th>
+                    <th scope="col" className="ta-r">Qté</th>
+                    <th scope="col" className="ta-r">Montant HT</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {doc.lignes.map((l, li) => (
+                    <tr key={li}>
+                      <td className="ta-l">{l.designation || "—"}</td>
+                      <td className="ta-l mono">{normCode(l.code) || "—"}</td>
+                      <td className="ta-r">
+                        <input
+                          className="rcp-edit"
+                          type="text"
+                          inputMode="decimal"
+                          defaultValue={fmtEdit(num(l.qte))}
+                          aria-label={"Quantité — " + (l.designation || "ligne")}
+                          onBlur={(e) => onEdit(side, di, li, "qte", e.target.value)}
+                        />
+                      </td>
+                      <td className="ta-r">
+                        <input
+                          className="rcp-edit"
+                          type="text"
+                          inputMode="decimal"
+                          defaultValue={fmtEdit(lineMontant(l))}
+                          aria-label={"Montant HT — " + (l.designation || "ligne")}
+                          onBlur={(e) => onEdit(side, di, li, "montant_ht", e.target.value)}
+                        />
+                      </td>
+                    </tr>
+                  ))}
+                  <tr className="rcp-total-row">
+                    <td className="ta-l strong" colSpan={3}>
+                      {stated != null ? "Lignes lues / total imprimé" : "Total des lignes lues"}
+                    </td>
+                    <td className="ta-r num strong">
+                      {eur(sum)}
+                      {stated != null ? " / " + eur(stated) : ""}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        );
+      })}
+    </>
   );
 }
 
@@ -710,6 +940,40 @@ const CSS = `
 .rcp-detail-toggle{background:none; border:1px solid var(--line); border-radius:10px; padding:9px 16px; font-size:13px; color:var(--muted); cursor:pointer; margin-top:4px;}
 .rcp-detail-toggle:hover{border-color:var(--brand); color:var(--brand);}
 .rcp-detail{margin-top:14px;}
+
+/* --- v2 : accessibilité, hiérarchie, action --- */
+.rcp-zone:focus-visible{outline:3px solid var(--brand); outline-offset:2px; border-color:var(--brand);}
+.rcp-btn:focus-visible,.rcp-detail-toggle:focus-visible,.rcp-file-x:focus-visible,.rcp-pwd-input:focus-visible{outline:3px solid var(--brand); outline-offset:2px;}
+.rcp-file-x{min-width:32px; min-height:32px; display:inline-flex; align-items:center; justify-content:center; border-radius:8px;}
+
+.rcp-verdict{display:flex; gap:16px; align-items:flex-start;}
+.rcp-verdict-icon{flex:none; width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:800; color:#fff; margin-top:2px;}
+.rcp-verdict.ok .rcp-verdict-icon{background:var(--ok);}
+.rcp-verdict.bad .rcp-verdict-icon{background:var(--bad);}
+.rcp-verdict.warn .rcp-verdict-icon{background:var(--warn);}
+.rcp-verdict-body{flex:1; min-width:0;}
+.rcp-verdict-label{font-size:12px; letter-spacing:.1em; text-transform:uppercase; font-weight:700; color:var(--bad);}
+.rcp-verdict-amount{font-size:clamp(30px,6vw,44px); font-weight:800; letter-spacing:-.03em; color:var(--bad); line-height:1.04; margin-top:2px;}
+
+.rcp-section-head{max-width:880px; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-weight:700; margin:22px 0 10px;}
+.rcp-issue{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px 18px; margin-bottom:12px;}
+.rcp-issue-head{display:flex; align-items:center; justify-content:space-between; gap:10px;}
+.rcp-issue-title{font-size:15px; font-weight:650; margin:0; display:flex; align-items:center; gap:8px;}
+.rcp-impact{font-size:15px; font-weight:700; color:var(--bad); background:var(--bad-soft); border-radius:8px; padding:3px 10px; white-space:nowrap;}
+.rcp-action{font-size:13.5px; color:var(--ink); background:var(--bg); border-left:3px solid var(--brand); border-radius:0 8px 8px 0; padding:9px 12px; margin:10px 0 12px; line-height:1.45;}
+
+@media (prefers-reduced-motion: reduce){
+  .rcp-spin{animation:none;}
+  .rcp-result{animation:none;}
+}
+
+.rcp-edit-hint{max-width:880px; font-size:13px; color:var(--ink); background:var(--brand-soft); border-radius:10px; padding:10px 14px; margin:0 0 12px; line-height:1.45;}
+.rcp-edit{width:88px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; padding:5px 7px; border:1px solid var(--line); border-radius:7px; background:#fff; color:var(--ink);}
+.rcp-edit:hover{border-color:var(--brand);}
+.rcp-edit:focus-visible{outline:2px solid var(--brand); outline-offset:1px; border-color:var(--brand);}
+.rcp-doc-ok{font-size:12.5px; font-weight:700; color:var(--ok); background:var(--ok-soft); border-radius:8px; padding:3px 10px; white-space:nowrap;}
+.rcp-doc-gap{font-size:12.5px; font-weight:700; color:var(--warn); background:var(--warn-soft); border-radius:8px; padding:3px 10px; white-space:nowrap;}
+.rcp-tag{font-size:11px; font-weight:600; color:var(--warn); background:var(--warn-soft); border-radius:6px; padding:2px 7px; margin-left:8px;}
 
 .rcp-foot{max-width:880px; margin:28px auto 0; font-size:12px; color:var(--muted); text-align:center;}
 `;
