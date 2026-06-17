@@ -32,7 +32,7 @@ function downscaleImage(file, maxSide = 2200, quality = 0.85) {
 
 /* Limite de corps de requête Vercel ≈ 4,5 Mo ; on vise ~3,3 Mo brut (≈4,4 Mo encodé). */
 const MAX_RAW = 2_900_000;
-const MAX_PAGES = 6;
+const MAX_PAGES = 2;
 
 function uint8ToB64(u8) {
   let s = "";
@@ -90,11 +90,6 @@ async function prepareChunks(file) {
   const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
   if (isPdf) {
     const buf = await file.arrayBuffer();
-    if (buf.byteLength <= MAX_RAW) {
-      return [
-        { data: uint8ToB64(new Uint8Array(buf)), mediaType: "application/pdf", isPdf: true },
-      ];
-    }
     const parts = await splitPdfToChunks(buf);
     return parts.map((d) => ({ data: d, mediaType: "application/pdf", isPdf: true }));
   }
@@ -133,52 +128,81 @@ function normalizeDoc(p, repaired) {
 class PasswordError extends Error {}
 
 async function extractChunk(payload, password) {
-  const r = await fetch("/api/extract", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...payload, password: password || "" }),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (r.status === 401) throw new PasswordError("mot de passe");
-  if (!r.ok) {
-    const why =
-      j.error ||
-      (r.status === 413
-        ? "paquet trop volumineux (réduisez la résolution du scan)"
-        : r.status === 504 || r.status === 502 || r.status === 408
-        ? "délai de lecture dépassé sur ce paquet"
-        : "erreur serveur " + r.status);
-    throw new Error("Lecture impossible : " + why);
-  }
-  const raw = stripFences(j.text || "");
-  try {
-    return normalizeDoc(JSON.parse(raw), false);
-  } catch {
-    try {
-      return normalizeDoc(repairJson(raw), true);
-    } catch {
-      throw new Error(
-        "Une partie d'un document n'a pas pu être lue (scan peu net). Rescannez cette page puis redéposez-la."
-      );
+  const MAX_TRIES = 5;
+  let lastWhy = "lecture impossible";
+  for (let t = 0; t < MAX_TRIES; t++) {
+    if (t > 0) {
+      const wait = Math.min(12000, 1000 * Math.pow(2, t - 1)) + Math.floor(Math.random() * 600);
+      await new Promise((res) => setTimeout(res, wait));
     }
+    let r, j;
+    try {
+      r = await fetch("/api/extract", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...payload, password: password || "" }),
+      });
+      j = await r.json().catch(() => ({}));
+    } catch {
+      lastWhy = "réseau injoignable";
+      continue; // erreur réseau → on réessaie
+    }
+    if (r.status === 401) throw new PasswordError("mot de passe");
+    if (r.ok) {
+      const raw = stripFences(j.text || "");
+      try {
+        return normalizeDoc(JSON.parse(raw), false);
+      } catch {
+        try {
+          return normalizeDoc(repairJson(raw), true);
+        } catch {
+          lastWhy = "scan peu net";
+          continue; // JSON cassé → un nouvel essai peut mieux lire
+        }
+      }
+    }
+    // réponse en erreur
+    if (r.status === 429 || r.status >= 500 || r.status === 408) {
+      lastWhy =
+        r.status === 429
+          ? "trop de lectures simultanées"
+          : r.status === 408
+          ? "délai dépassé sur ce paquet"
+          : "service de lecture momentanément indisponible";
+      continue; // transitoire → backoff puis nouvel essai
+    }
+    // erreur définitive (4xx hors 408/429)
+    throw new Error("Lecture impossible : " + (j.error || "erreur " + r.status));
   }
+  throw new Error("Lecture impossible après plusieurs essais (" + lastWhy + ")");
 }
 
-/* Lit un fichier entier : le découpe si besoin, renvoie un doc par paquet. */
+/* Lit un fichier entier : le découpe, lit les paquets en parallèle, et ne s'arrête
+   jamais sur un paquet récalcitrant — il est noté pour rescan, le reste continue. */
 async function extractFile(file, password, onChunk) {
   const chunks = await prepareChunks(file);
-  const docs = [];
-  for (let i = 0; i < chunks.length; i++) {
-    if (onChunk) onChunk(i + 1, chunks.length);
-    try {
-      docs.push(await extractChunk(chunks[i], password));
-    } catch (e) {
-      if (e instanceof PasswordError) throw e;
-      await new Promise((res) => setTimeout(res, 800));
-      docs.push(await extractChunk(chunks[i], password)); // un essai de plus
+  const docs = new Array(chunks.length);
+  const failures = [];
+  const CONCURRENCY = 2;
+  let next = 0;
+  let done = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= chunks.length) return;
+      try {
+        docs[i] = await extractChunk(chunks[i], password);
+      } catch (e) {
+        if (e instanceof PasswordError) throw e;
+        docs[i] = { type: null, total_ht: null, lignes: [], _repaired: false, _failed: true };
+        failures.push(i + 1);
+      }
+      done++;
+      if (onChunk) onChunk(done, chunks.length);
     }
   }
-  return docs;
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, worker));
+  return { docs, failures };
 }
 
 /* ------------------------------------------------------------------ */
@@ -312,6 +336,7 @@ export default function Page() {
   const [wpDocs, setWpDocs] = useState(null);
   const [password, setPassword] = useState("");
   const [needPassword, setNeedPassword] = useState(false);
+  const [notice, setNotice] = useState("");
 
   const addFiles = (side, list) => {
     const arr = Array.from(list).filter(
@@ -328,8 +353,10 @@ export default function Page() {
     setError("");
     setResult(null);
     setTruncated(false);
+    setNotice("");
     setStatus("reading");
     try {
+      let failed = 0;
       const blDocs = [];
       for (let i = 0; i < blFiles.length; i++) {
         const part = blFiles.length > 1 ? ` (${i + 1}/${blFiles.length})` : "";
@@ -340,7 +367,8 @@ export default function Page() {
               : `Lecture des BL CERP${part}`
           )
         );
-        blDocs.push(...got);
+        blDocs.push(...got.docs);
+        failed += got.failures.length;
       }
       const wpDocs = [];
       for (let i = 0; i < wpFiles.length; i++) {
@@ -352,7 +380,8 @@ export default function Page() {
               : `Lecture de la réception Winpharma${part}`
           )
         );
-        wpDocs.push(...got);
+        wpDocs.push(...got.docs);
+        failed += got.failures.length;
       }
       setProgress("Comparaison…");
       setBlDocs(blDocs);
@@ -362,6 +391,11 @@ export default function Page() {
       setExtractions({ bl: blAgg, wp: wpAgg });
       setTruncated([...blDocs, ...wpDocs].some((d) => d._repaired));
       setResult(reconcile(blAgg, wpAgg));
+      setNotice(
+        failed > 0
+          ? `${failed} paquet(s) (≈${failed * 2} pages) n'ont pas pu être lus, même après plusieurs essais. Le résultat ci-dessous est PARTIEL : rescannez ces pages (plus net / niveaux de gris) et relancez.`
+          : ""
+      );
       const mismatch =
         (blAgg.statedTotal != null &&
           Math.abs(blAgg.statedTotal - blAgg.sumLines) >= 0.02) ||
@@ -388,6 +422,7 @@ export default function Page() {
     setExtractions(null);
     setError("");
     setTruncated(false);
+    setNotice("");
     setBlDocs(null);
     setWpDocs(null);
     setShowDetail(false);
@@ -610,6 +645,12 @@ export default function Page() {
                   </span>
                 </div>
               </div>
+            </div>
+          )}
+
+          {notice && (
+            <div className="rcp-integrity" role="alert">
+              ⚠ {notice}
             </div>
           )}
 
