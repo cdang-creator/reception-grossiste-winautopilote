@@ -613,118 +613,131 @@ export default function Page() {
         </div>
       )}
 
-      {result && (
-        <div className="rcp-result">
-          {result.concordance && !result.pricesMissing ? (
-            <div className="rcp-allgood" role="status">
-              <span className="rcp-allgood-icon" aria-hidden="true">✓</span>
-              <div>
-                <div className="rcp-allgood-main">Aucun écart</div>
-                <div className="rcp-allgood-sub">
-                  BL <b className="num">{eur(result.totalBL)}</b> = Reçu{" "}
-                  <b className="num">{eur(result.totalWP)}</b>. Rien à traiter.
+      {result && (() => {
+        const ecarts = result.diffs.filter(
+          (d) => d.kind === "qty" || d.kind === "price" || d.kind === "blonly"
+        );
+        const recuSansBon = result.diffs.filter((d) => d.kind === "wponly");
+        const aucunEcart = ecarts.length === 0 && recuSansBon.length === 0;
+        const sumEcarts = ecarts.reduce((s, d) => s + d.impact, 0);
+        const sumRecu = recuSansBon.reduce((s, d) => s + d.impact, 0);
+        const nLignes = ecarts.length + recuSansBon.length;
+        const justifie = Math.abs(result.reste) < 0.05;
+        return (
+          <div className="rcp-result">
+            {aucunEcart ? (
+              result.concordance ? (
+                <div className="rcp-allgood" role="status">
+                  <span className="rcp-allgood-icon" aria-hidden="true">✓</span>
+                  <div>
+                    <div className="rcp-allgood-main">Aucun écart</div>
+                    <div className="rcp-allgood-sub">
+                      BL <b className="num">{eur(result.totalBL)}</b> = Reçu{" "}
+                      <b className="num">{eur(result.totalWP)}</b>. Rien à traiter.
+                    </div>
+                  </div>
                 </div>
-              </div>
-            </div>
-          ) : (
-            <>
-              <div className="rcp-summary" role="status">
-                <div className="rcp-summary-top">
-                  <span className="rcp-summary-label">Écart</span>
-                  <span className="rcp-summary-amount num">{eur(Math.abs(result.ecart))}</span>
-                </div>
-                <div className="rcp-summary-sub">
-                  BL <b className="num">{eur(result.totalBL)}</b> · Reçu{" "}
-                  <b className="num">{eur(result.totalWP)}</b> ·{" "}
-                  <b>{result.diffs.length}</b> ligne{result.diffs.length > 1 ? "s" : ""} à vérifier
-                  {Math.abs(result.reste) >= 0.05 && (
-                    <>
-                      {" · "}
-                      <span className="rcp-summary-reste">
-                        {eur(Math.abs(result.reste))} non expliqué (lecture à revoir)
-                      </span>
-                    </>
-                  )}
-                </div>
-              </div>
-
-              {(result.pricesMissing || truncated) && (
-                <div className="rcp-note" role="alert">
-                  {result.pricesMissing
-                    ? "Prix non détectés sur les scans — la comparaison des montants n'est pas fiable. Vérifiez que les bons montrent bien les prix."
-                    : "Un document était trop long : la lecture a pu être tronquée. Vérifiez le détail avant de conclure."}
-                </div>
-              )}
-
-              {result.diffs.length === 0 ? (
+              ) : (
                 <div className="rcp-note">
                   Les totaux diffèrent mais aucune ligne précise ne ressort : une ligne est sûrement
                   mal lue. Ouvrez le détail pour corriger à la main.
                 </div>
-              ) : (
-                <div className="rcp-difflist">
-                  {result.diffs.map((d, i) => (
-                    <div className={"rcp-diff " + d.kind} key={i}>
-                      <div className="rcp-diff-body">
-                        <div className="rcp-diff-name">{d.designation}</div>
-                        <div className="rcp-diff-meta">
-                          <span className={"rcp-diff-tag " + d.kind}>{d.reason}</span>
-                          {d.code && <span className="rcp-diff-code mono">{d.code}</span>}
-                        </div>
-                        <div className="rcp-diff-cmp">
-                          <span>
-                            BL&nbsp;:{" "}
-                            <b>
-                              {d.inBL
-                                ? qty(d.qteBL) + " × " + eur(d.puBL) + " = " + eur(d.montantBL)
-                                : "—"}
-                            </b>
-                          </span>
-                          <span>
-                            Reçu&nbsp;:{" "}
-                            <b>
-                              {d.inWP
-                                ? qty(d.qteWP) + " × " + eur(d.puWP) + " = " + eur(d.montantWP)
-                                : "—"}
-                            </b>
-                          </span>
-                        </div>
-                      </div>
-                      <div className="rcp-diff-impact num">
-                        {(d.impact > 0 ? "+" : "") + eur(d.impact)}
-                      </div>
+              )
+            ) : (
+              <>
+                <div className={"rcp-status " + (ecarts.length ? "bad" : "ok")} role="status">
+                  <span className="rcp-status-icon" aria-hidden="true">
+                    {ecarts.length ? "!" : "✓"}
+                  </span>
+                  <div className="rcp-status-body">
+                    <div className="rcp-status-main">
+                      {ecarts.length > 0
+                        ? `${ecarts.length} écart${ecarts.length > 1 ? "s" : ""} à traiter`
+                        : "Aucun écart à traiter"}
                     </div>
-                  ))}
+                    <div className="rcp-status-recon">
+                      Écart <b className="num">{eur(Math.abs(result.ecart))}</b> ·{" "}
+                      {justifie ? (
+                        <span className="rcp-ok-text">intégralement justifié ✓</span>
+                      ) : (
+                        <span className="rcp-summary-reste">
+                          reste {eur(Math.abs(result.reste))} non expliqué
+                        </span>
+                      )}
+                    </div>
+                    <div className="rcp-status-totals">
+                      BL <b className="num">{eur(result.totalBL)}</b> · Reçu{" "}
+                      <b className="num">{eur(result.totalWP)}</b>
+                      {recuSansBon.length > 0 && (
+                        <>
+                          {" · "}
+                          {recuSansBon.length} reçu{recuSansBon.length > 1 ? "s" : ""} sans bon
+                        </>
+                      )}
+                    </div>
+                  </div>
                 </div>
-              )}
 
-              <div className="rcp-foot-note">
-                Une ligne « sur le BL, absent de la réception » peut être un appro hors-commande
-                (à ignorer). Vérifiez toujours avant de réclamer.
+                {(result.pricesMissing || truncated) && (
+                  <div className="rcp-note" role="alert">
+                    {result.pricesMissing
+                      ? "Prix non détectés sur les scans — comparaison des montants non fiable."
+                      : "Un document était trop long : lecture peut-être tronquée. Vérifiez le détail."}
+                  </div>
+                )}
+
+                {ecarts.length > 0 && (
+                  <>
+                    <div className="rcp-group-head">
+                      <span>À traiter — {ecarts.length} écart{ecarts.length > 1 ? "s" : ""}</span>
+                      <span className="num">{(sumEcarts > 0 ? "+" : "") + eur(sumEcarts)}</span>
+                    </div>
+                    <div className="rcp-difflist">
+                      {ecarts.map((d, i) => (
+                        <DiffCard d={d} key={"e" + i} />
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {recuSansBon.length > 0 && (
+                  <details className="rcp-onesided">
+                    <summary>
+                      {recuSansBon.length} reçu{recuSansBon.length > 1 ? "s" : ""} sans bon de
+                      livraison ({(sumRecu > 0 ? "+" : "") + eur(sumRecu)}) — bon probablement non
+                      scanné
+                    </summary>
+                    <div className="rcp-difflist">
+                      {recuSansBon.map((d, i) => (
+                        <DiffCard d={d} key={"o" + i} />
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </>
+            )}
+
+            <button className="rcp-detail-toggle" onClick={() => setShowDetail((s) => !s)}>
+              {showDetail ? "Masquer" : "Voir / corriger"} le détail complet
+            </button>
+            {showDetail && blDocs && wpDocs && (
+              <div className="rcp-detail">
+                <p className="rcp-edit-hint">
+                  Une valeur mal lue ? Clique le chiffre, tape le bon (la virgule marche), sors du
+                  champ : la comparaison se recalcule.
+                </p>
+                <EditableDetail side="bl" label="BL CERP" docs={blDocs} onEdit={editLine} />
+                <EditableDetail
+                  side="wp"
+                  label="Réception Winpharma"
+                  docs={wpDocs}
+                  onEdit={editLine}
+                />
               </div>
-            </>
-          )}
-
-          <button className="rcp-detail-toggle" onClick={() => setShowDetail((s) => !s)}>
-            {showDetail ? "Masquer" : "Voir / corriger"} le détail complet
-          </button>
-          {showDetail && blDocs && wpDocs && (
-            <div className="rcp-detail">
-              <p className="rcp-edit-hint">
-                Une valeur mal lue ? Clique le chiffre, tape le bon (la virgule marche), sors du
-                champ : la comparaison se recalcule.
-              </p>
-              <EditableDetail side="bl" label="BL CERP" docs={blDocs} onEdit={editLine} />
-              <EditableDetail
-                side="wp"
-                label="Réception Winpharma"
-                docs={wpDocs}
-                onEdit={editLine}
-              />
-            </div>
-          )}
-        </div>
-      )}
+            )}
+          </div>
+        );
+      })()}
 
       <footer className="rcp-foot">Contrôle de première passe — vérifiez le détail avant toute réclamation.</footer>
     </div>
@@ -734,6 +747,39 @@ export default function Page() {
 /* ------------------------------------------------------------------ */
 /*  Sous-composants                                                    */
 /* ------------------------------------------------------------------ */
+
+const ACTIONS = {
+  qty: "Vérifier la réception, réclamer l'écart à CERP",
+  price: "Vérifier le prix facturé vs Winpharma",
+  blonly: "Enregistrer la réception, ou réclamer si non livré",
+  wponly: "Retrouver / scanner le bon, ou vérifier la saisie",
+};
+
+function DiffCard({ d }) {
+  return (
+    <div className={"rcp-diff " + d.kind}>
+      <div className="rcp-diff-body">
+        <div className="rcp-diff-name">{d.designation}</div>
+        <div className="rcp-diff-meta">
+          <span className={"rcp-diff-tag " + d.kind}>{d.reason}</span>
+          {d.code && <span className="rcp-diff-code mono">{d.code}</span>}
+        </div>
+        <div className="rcp-diff-cmp">
+          <span>
+            BL&nbsp;:{" "}
+            <b>{d.inBL ? qty(d.qteBL) + " × " + eur(d.puBL) + " = " + eur(d.montantBL) : "—"}</b>
+          </span>
+          <span>
+            Reçu&nbsp;:{" "}
+            <b>{d.inWP ? qty(d.qteWP) + " × " + eur(d.puWP) + " = " + eur(d.montantWP) : "—"}</b>
+          </span>
+        </div>
+        {ACTIONS[d.kind] && <div className="rcp-diff-action">→ {ACTIONS[d.kind]}</div>}
+      </div>
+      <div className="rcp-diff-impact num">{(d.impact > 0 ? "+" : "") + eur(d.impact)}</div>
+    </div>
+  );
+}
 
 function DropZone({ label, hint, files, onAdd, onRemove, tone }) {
   const [over, setOver] = useState(false);
@@ -1067,10 +1113,42 @@ const CSS = `
 
 /* --- Redesign : résumé minimal --- */
 .rcp-summary{max-width:880px; margin:0 auto 16px; background:var(--card); border:1px solid var(--line); border-left:5px solid var(--bad); border-radius:14px; padding:16px 20px;}
+
+/* --- Redesign : bloc statut en tête --- */
+.rcp-status{max-width:880px; margin:0 auto 18px; display:flex; gap:16px; align-items:flex-start; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:18px 22px;}
+.rcp-status.bad{border-left:5px solid var(--bad);}
+.rcp-status.ok{border-left:5px solid var(--ok);}
+.rcp-status-icon{flex:none; width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:20px; font-weight:800; color:#fff;}
+.rcp-status.bad .rcp-status-icon{background:var(--bad);}
+.rcp-status.ok .rcp-status-icon{background:var(--ok);}
+.rcp-status-body{flex:1; min-width:0;}
+.rcp-status-main{font-size:21px; font-weight:750; letter-spacing:-.02em; line-height:1.1;}
+.rcp-status.bad .rcp-status-main{color:var(--bad);}
+.rcp-status.ok .rcp-status-main{color:var(--ok);}
+.rcp-status-recon{margin-top:5px; font-size:14px; color:var(--muted);}
+.rcp-status-recon b{color:var(--ink);}
+.rcp-status-totals{margin-top:3px; font-size:12.5px; color:var(--muted);}
+.rcp-ok-text{color:var(--ok); font-weight:600;}
+
+.rcp-diff-action{margin-top:7px; font-size:12.5px; font-weight:600; color:var(--brand);}
 .rcp-summary-top{display:flex; align-items:baseline; gap:12px;}
 .rcp-summary-label{font-size:12px; letter-spacing:.1em; text-transform:uppercase; font-weight:700; color:var(--bad);}
 .rcp-summary-amount{font-size:clamp(26px,5vw,36px); font-weight:800; letter-spacing:-.03em; color:var(--bad); line-height:1;}
 .rcp-summary-sub{margin-top:8px; font-size:14px; color:var(--muted);}
+.rcp-summary-main{font-size:18px; font-weight:750; letter-spacing:-.01em; color:var(--bad);}
+.rcp-summary-recon{margin-top:8px; font-size:14px; font-weight:600; color:var(--ink);}
+.rcp-group-head{max-width:880px; margin:18px auto 8px; display:flex; justify-content:space-between; align-items:baseline; font-size:12px; letter-spacing:.08em; text-transform:uppercase; font-weight:700; color:var(--muted);}
+.rcp-group-head .num{font-size:14px; color:var(--ink);}
+.rcp-summary.ok{border-left-color:var(--ok);}
+.rcp-summary.ok .rcp-summary-main{color:var(--ok);}
+.rcp-onesided{max-width:880px; margin:14px auto 0;}
+.rcp-onesided>summary{cursor:pointer; font-size:13.5px; color:var(--muted); padding:11px 15px; background:var(--card); border:1px solid var(--line); border-radius:10px; list-style:none; line-height:1.4;}
+.rcp-onesided>summary::-webkit-details-marker{display:none;}
+.rcp-onesided>summary::before{content:"▸ "; color:var(--muted);}
+.rcp-onesided[open]>summary::before{content:"▾ ";}
+.rcp-onesided>summary:hover{border-color:var(--brand); color:var(--brand);}
+.rcp-onesided[open]>summary{margin-bottom:10px; font-weight:600;}
+.rcp-onesided .rcp-diff{opacity:.82;}
 .rcp-summary-sub b{color:var(--ink);}
 .rcp-summary-reste{color:var(--warn); font-weight:600;}
 
