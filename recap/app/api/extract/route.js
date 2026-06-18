@@ -24,7 +24,7 @@ T = TOTAL HT réellement livré/reçu du document :
       "Qté: 145 2593 365 2228 676 18670,18 19192,18 4204,70 4346,48" → T = 4204,70 (le HT Reçu), surtout PAS 18670,18 (le commandé).
     null si vraiment absent.
 L = une entrée par ligne livrée/reçue. Pour chaque ligne :
-  c = uniquement les chiffres du code CIP/EAN (colonne "Code article", 13 chiffres), sans espaces ni lettres ; null si absent. N'utilise JAMAIS un code court interne.
+  c = le code CIP/EAN COMPLET. Un code CIP fait 13 chiffres. Il est très souvent affiché en GROUPES séparés par des espaces, par exemple "34009 3027387 6" : tu DOIS recoller tous les groupes pour donner les 13 chiffres d'affilée, ici "3400930273876". Ne renvoie JAMAIS seulement le groupe du milieu ("3027387") ni un code partiel : toujours les 13 chiffres complets, sans espaces ni lettres. null seulement si le code est vraiment absent. N'utilise jamais un code court interne du bon de préparation.
   d = désignation, raccourcie à ~30 caractères maximum si elle est longue.
   q = quantité LIVRÉE/REÇUE.
   p = prix unitaire HT net de la ligne ; null si absent.
