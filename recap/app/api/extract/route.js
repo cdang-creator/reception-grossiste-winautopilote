@@ -1,30 +1,35 @@
 export const runtime = "nodejs";
 export const maxDuration = 60;
-const PROMPT = `Tu lis un document de pharmacie (bon de livraison grossiste CERP, ou état de réception Winpharma/WinAutopilote).
+const PROMPT = `Tu lis un document de pharmacie : soit un BON DE LIVRAISON CERP (scan d'un bon papier), soit un état de réception/commande Winpharma (WinAutopilote).
 Renvoie UNIQUEMENT du JSON valide et compact, sans aucun texte autour ni balises Markdown.
 Schéma à clés courtes, à respecter exactement :
 {"t":"BL"|"WP"|"X","T":nombre|null,"L":[{"c":"chiffres du code|null","d":"désignation","q":nombre,"p":nombre|null,"m":nombre|null}]}
 
-RÈGLE CAPITALE — COMMANDÉ vs REÇU :
-Ces documents affichent souvent DEUX jeux de colonnes : ce qui a été COMMANDÉ et ce qui a été RÉELLEMENT REÇU.
-Tu dois TOUJOURS extraire le RÉELLEMENT REÇU, jamais le commandé.
-- Quantité : il y a souvent "Qté" (commandée), "QtéR" (reçue) et "QtéA" (en attente/manquante). Prends TOUJOURS QtéR (la reçue).
-- Montant : il y a souvent "Montant HT" (valeur commandée) ET "Mt HT Reçu" / "Montant HT Reçu" (valeur reçue). Prends TOUJOURS la colonne REÇU.
-- IGNORE complètement les lignes non reçues (QtéR = 0) : ne les mets pas dans L.
-- Si le document n'a qu'UNE seule colonne de quantité et de montant, prends-la simplement.
+QUEL TABLEAU LIRE (TRÈS IMPORTANT) :
+Sur un BON DE LIVRAISON CERP scanné, il y a souvent DEUX zones côte à côte :
+  - à GAUCHE un bon de préparation interne (codes courts type "Code géo", "Code Vérif", "Prix EUR") ;
+  - à DROITE le BON OFFICIEL CERP : colonnes "Code article" (code CIP à 13 chiffres), "Dénomination", "Qté Livrée", "Prix unitaire HT", "Montant HT", avec un grand TOTAL en bas à droite.
+→ Lis UNIQUEMENT le bon officiel de DROITE. IGNORE totalement le bon de préparation de gauche : il fait doublon et utilise des codes courts qui faussent tout.
+Sur un document Winpharma/commande, lis simplement le tableau principal.
 
-t = type du document.
-T = total HT RÉELLEMENT REÇU du document = total de la colonne "Mt HT Reçu" (PAS le total commandé "Montant HT").
-    Sur la ligne de totaux, c'est l'un des derniers blocs. Exemple réel de ligne de totaux :
-    "Qté: 145 2593 365 2228 676 18670,18 19192,18 4204,70 4346,48" → T = 4204,70 (le total HT Reçu), surtout PAS 18670,18 (le commandé).
+COMMANDÉ vs REÇU/LIVRÉ : prends TOUJOURS le réellement REÇU/LIVRÉ, jamais le commandé.
+- Quantité : prends la quantité LIVRÉE/REÇUE (colonne "Qté Livrée" sur un BL, "QtéR" sur Winpharma). Jamais la commandée ("Qté Cdée"/"Qté").
+- Montant : prends le "Montant HT" de la dernière colonne (= Qté Livrée × Prix unitaire HT net) sur un BL, ou "Mt HT Reçu" sur Winpharma. Jamais le montant commandé.
+- IGNORE les lignes non livrées/non reçues (quantité = 0) : ne les mets pas dans L.
+
+t = type du document ("BL" pour un bon de livraison, "WP" pour Winpharma/commande, "X" si incertain).
+T = TOTAL HT réellement livré/reçu du document :
+    - BL : le grand TOTAL en bas à droite du bon officiel. ATTENTION : ce document peut contenir PLUSIEURS bons (plusieurs pages, donc plusieurs "TOTAL"). Dans ce cas, ADDITIONNE tous ces totaux et mets la SOMME dans T (un seul nombre pour tout le document).
+    - Winpharma : le total de la colonne "Mt HT Reçu". Exemple réel de ligne de totaux Winpharma :
+      "Qté: 145 2593 365 2228 676 18670,18 19192,18 4204,70 4346,48" → T = 4204,70 (le HT Reçu), surtout PAS 18670,18 (le commandé).
     null si vraiment absent.
-L = une entrée par ligne produit REÇUE. Pour chaque ligne :
-  c = uniquement les chiffres du code produit (CIP13/EAN), sans espaces ni lettres ; null si absent.
+L = une entrée par ligne livrée/reçue. Pour chaque ligne :
+  c = uniquement les chiffres du code CIP/EAN (colonne "Code article", 13 chiffres), sans espaces ni lettres ; null si absent. N'utilise JAMAIS un code court interne.
   d = désignation, raccourcie à ~30 caractères maximum si elle est longue.
-  q = quantité RÉELLEMENT REÇUE (colonne QtéR). Jamais la quantité commandée.
+  q = quantité LIVRÉE/REÇUE.
   p = prix unitaire HT net de la ligne ; null si absent.
-  m = montant HT RÉELLEMENT REÇU de la ligne (colonne "Mt HT Reçu"). Jamais le montant commandé.
-Impératifs : extrais CHAQUE ligne reçue. N'invente aucune valeur (null si illisible). Nombres au
+  m = montant HT de la ligne (Qté × PU HT net, la dernière colonne) ; null si absent.
+Impératifs : extrais CHAQUE ligne livrée/reçue. N'invente aucune valeur (null si illisible). Nombres au
 format français ("1 234,56") renvoyés en nombres JSON standard (1234.56). Aucune autre clé.`;
 export async function POST(req) {
   let body;
@@ -33,7 +38,7 @@ export async function POST(req) {
   } catch {
     return Response.json({ error: "requête invalide" }, { status: 400 });
   }
-  const { data, mediaType, isPdf, password } = body || {};
+  const { data, mediaType, isPdf, password, hint } = body || {};
   // Protection optionnelle par mot de passe partagé
   if (process.env.SITE_PASSWORD && password !== process.env.SITE_PASSWORD) {
     return Response.json({ error: "mot de passe incorrect" }, { status: 401 });
@@ -56,7 +61,12 @@ export async function POST(req) {
       body: JSON.stringify({
         model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6",
         max_tokens: 16000,
-        messages: [{ role: "user", content: [block, { type: "text", text: PROMPT }] }],
+        messages: [
+          {
+            role: "user",
+            content: [block, { type: "text", text: hint ? PROMPT + "\n\n" + hint : PROMPT }],
+          },
+        ],
       }),
     });
   } catch {
