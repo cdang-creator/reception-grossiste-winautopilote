@@ -30,9 +30,10 @@ function downscaleImage(file, maxSide = 2200, quality = 0.85) {
   });
 }
 
-/* Limite de corps de requête Vercel ≈ 4,5 Mo ; on vise ~3,3 Mo brut (≈4,4 Mo encodé). */
-const MAX_RAW = 2_900_000;
-const MAX_PAGES = 2;
+/* Taille max par paquet, volontairement basse (~1 Mo ≈ 2-3 pages scannées). Objectif :
+   que CHAQUE appel finisse sous le délai de 60 s de Vercel, même avec Opus (lent mais précis).
+   Si ça déborde encore, baisser à 700_000 ; si c'est trop lent, remonter prudemment. */
+const MAX_RAW = 1_000_000;
 
 function uint8ToB64(u8) {
   let s = "";
@@ -64,7 +65,7 @@ async function splitPdfToChunks(arrayBuffer) {
   let cur = [];
   let curSize = 0;
   for (let i = 0; i < n; i++) {
-    if (cur.length && (curSize + sizes[i] > MAX_RAW || cur.length >= MAX_PAGES)) {
+    if (cur.length && curSize + sizes[i] > MAX_RAW) {
       groups.push(cur);
       cur = [];
       curSize = 0;
@@ -90,6 +91,11 @@ async function prepareChunks(file) {
   const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
   if (isPdf) {
     const buf = await file.arrayBuffer();
+    if (buf.byteLength <= MAX_RAW) {
+      return [
+        { data: uint8ToB64(new Uint8Array(buf)), mediaType: "application/pdf", isPdf: true },
+      ];
+    }
     const parts = await splitPdfToChunks(buf);
     return parts.map((d) => ({ data: d, mediaType: "application/pdf", isPdf: true }));
   }
@@ -111,98 +117,151 @@ function repairJson(raw) {
   return JSON.parse(raw.slice(0, lastObj + 1).trim() + "]}");
 }
 
+/* Convertit en nombre, qu'on reçoive déjà un nombre OU une chaîne au format
+   français ("1 234,56") / standard. Renvoie null si non convertible. */
+function toNum(v) {
+  if (typeof v === "number") return isFinite(v) ? v : null;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = parseFloat(v.replace(/\s/g, "").replace(",", "."));
+    return isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 function normalizeDoc(p, repaired) {
   const src = p.L || p.lignes || [];
   const lignes = src.map((l) => ({
     code: l.c != null ? l.c : l.code,
     designation: l.d != null ? l.d : l.designation,
-    qte: l.q != null ? l.q : l.qte,
-    pu_ht: l.p != null ? l.p : l.pu_ht,
-    montant_ht: l.m != null ? l.m : l.montant_ht,
+    qte: toNum(l.q != null ? l.q : l.qte),
+    pu_ht: toNum(l.p != null ? l.p : l.pu_ht),
+    montant_ht: toNum(l.m != null ? l.m : l.montant_ht),
   }));
-  const total =
-    typeof p.T === "number" ? p.T : typeof p.total_ht === "number" ? p.total_ht : null;
+  const total = toNum(p.T != null ? p.T : p.total_ht);
   return { type: p.t || p.type || null, total_ht: total, lignes, _repaired: !!repaired };
 }
 
 class PasswordError extends Error {}
 
-async function extractChunk(payload, password) {
-  const MAX_TRIES = 5;
-  let lastWhy = "lecture impossible";
-  for (let t = 0; t < MAX_TRIES; t++) {
-    if (t > 0) {
-      const wait = Math.min(12000, 1000 * Math.pow(2, t - 1)) + Math.floor(Math.random() * 600);
-      await new Promise((res) => setTimeout(res, wait));
-    }
-    let r, j;
+/* Petite pause (utilisée pour patienter avant un réessai). */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* Isole l'objet JSON même si le modèle a ajouté du texte autour ou des ``` */
+function extractJsonObject(text) {
+  let t = String(text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) t = t.slice(start, end + 1);
+  return t;
+}
+
+/* Somme des montants de lignes d'un doc lu (sert d'étalon contre le total imprimé). */
+function docLineSum(doc) {
+  return (doc.lignes || []).reduce((s, l) => {
+    const m =
+      typeof l.montant_ht === "number"
+        ? l.montant_ht
+        : typeof l.pu_ht === "number"
+        ? l.pu_ht * (typeof l.qte === "number" ? l.qte : 0)
+        : 0;
+    return s + m;
+  }, 0);
+}
+
+/* Un appel /api/extract, avec réessais (429, 5xx/timeout, réseau, JSON illisible).
+   `hint` = consigne supplémentaire envoyée au modèle (utilisée pour la relecture étalon). */
+async function requestExtract(payload, password, hint) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    let r;
     try {
       r = await fetch("/api/extract", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...payload, password: password || "" }),
+        body: JSON.stringify({ ...payload, password: password || "", hint: hint || "" }),
       });
-      j = await r.json().catch(() => ({}));
     } catch {
-      lastWhy = "réseau injoignable";
-      continue; // erreur réseau → on réessaie
+      await sleep(1500);
+      continue;
     }
+
+    if (r.status === 429 || r.status >= 500) {
+      const ra = Number(r.headers.get("retry-after"));
+      const wait = ra ? ra * 1000 : Math.min(2 ** attempt * 1000, 60000);
+      await sleep(wait);
+      continue;
+    }
+
+    const j = await r.json().catch(() => ({}));
     if (r.status === 401) throw new PasswordError("mot de passe");
-    if (r.ok) {
-      const raw = stripFences(j.text || "");
+    if (!r.ok) throw new Error(j.error ? "Lecture impossible : " + j.error : "Lecture impossible.");
+
+    const raw = extractJsonObject(j.text || "");
+    try {
+      return normalizeDoc(JSON.parse(raw), false);
+    } catch {
       try {
-        return normalizeDoc(JSON.parse(raw), false);
+        return normalizeDoc(repairJson(raw), true); // tolère une réponse coupée
       } catch {
-        try {
-          return normalizeDoc(repairJson(raw), true);
-        } catch {
-          lastWhy = "scan peu net";
-          continue; // JSON cassé → un nouvel essai peut mieux lire
-        }
+        await sleep(800);
+        continue;
       }
     }
-    // réponse en erreur
-    if (r.status === 429 || r.status >= 500 || r.status === 408) {
-      lastWhy =
-        r.status === 429
-          ? "trop de lectures simultanées"
-          : r.status === 408
-          ? "délai dépassé sur ce paquet"
-          : "service de lecture momentanément indisponible";
-      continue; // transitoire → backoff puis nouvel essai
-    }
-    // erreur définitive (4xx hors 408/429)
-    throw new Error("Lecture impossible : " + (j.error || "erreur " + r.status));
   }
-  throw new Error("Lecture impossible après plusieurs essais (" + lastWhy + ")");
+  throw new Error(
+    "Une partie d'un document n'a pas pu être lue (scan peu net). Rescannez cette page puis redéposez-la."
+  );
 }
 
-/* Lit un fichier entier : le découpe, lit les paquets en parallèle, et ne s'arrête
-   jamais sur un paquet récalcitrant — il est noté pour rescan, le reste continue. */
-async function extractFile(file, password, onChunk) {
-  const chunks = await prepareChunks(file);
-  const docs = new Array(chunks.length);
-  const failures = [];
-  const CONCURRENCY = 2;
-  let next = 0;
-  let done = 0;
-  async function worker() {
-    while (true) {
-      const i = next++;
-      if (i >= chunks.length) return;
-      try {
-        docs[i] = await extractChunk(chunks[i], password);
-      } catch (e) {
-        if (e instanceof PasswordError) throw e;
-        docs[i] = { type: null, total_ht: null, lignes: [], _repaired: false, _failed: true };
-        failures.push(i + 1);
-      }
-      done++;
-      if (onChunk) onChunk(done, chunks.length);
+/* Lecture d'un paquet AVEC AUTOCONTRÔLE :
+   on lit, puis on vérifie que la somme des lignes colle au TOTAL imprimé du bon.
+   Si ça ne colle pas, on relit en donnant l'écart au modèle (jusqu'à 3 relectures),
+   et on garde la meilleure lecture. C'est l'« étalon-total ». */
+async function extractChunk(payload, password) {
+  let best = await requestExtract(payload, password, null);
+
+  // Pas de total imprimé lisible → rien à vérifier, on garde tel quel.
+  if (typeof best.total_ht !== "number") return best;
+
+  let bestGap = Math.abs(best.total_ht - docLineSum(best));
+  for (let i = 0; i < 3 && bestGap > 0.05; i++) {
+    const t = best.total_ht;
+    const lu = docLineSum(best);
+    const manque = t - lu;
+    const hint =
+      `AUTOCONTRÔLE — Le ou les TOTAL imprimés de ce document valent ${t.toFixed(2)} € au total, ` +
+      `mais la somme des lignes que tu viens d'extraire fait ${lu.toFixed(2)} € ` +
+      `(écart de ${manque.toFixed(2)} €). Tu as raté ou mal lu une ou plusieurs lignes. ` +
+      `Relis TRÈS attentivement le bon officiel et renvoie TOUTES les lignes livrées, ` +
+      `de sorte que leur somme tombe sur ${t.toFixed(2)} €.`;
+
+    let next;
+    try {
+      next = await requestExtract(payload, password, hint);
+    } catch {
+      break; // on garde la meilleure lecture obtenue jusque-là
+    }
+    const gap =
+      typeof next.total_ht === "number"
+        ? Math.abs(next.total_ht - docLineSum(next))
+        : Math.abs(t - docLineSum(next));
+    if (gap < bestGap) {
+      best = next;
+      bestGap = gap;
     }
   }
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, worker));
-  return { docs, failures };
+  best._unbalanced = bestGap > 0.05; // n'a pas réussi à équilibrer → à vérifier à la main
+  return best;
+}
+
+/* Lit un fichier entier : le découpe si besoin, renvoie un doc par paquet. */
+async function extractFile(file, password, onChunk) {
+  const chunks = await prepareChunks(file);
+  const docs = [];
+  for (let i = 0; i < chunks.length; i++) {
+    if (onChunk) onChunk(i + 1, chunks.length);
+    docs.push(await extractChunk(chunks[i], password));
+  }
+  return docs;
 }
 
 /* ------------------------------------------------------------------ */
@@ -299,17 +358,49 @@ function reconcile(bl, wp) {
       inWP: !!w,
     });
   }
-  const totalBL = bl.sumLines;
-  const totalWP = wp.sumLines;
+  // VERDICT ancré sur les TOTAUX IMPRIMÉS (le grand total en bas de chaque bon),
+  // qui sont les chiffres les plus fiables. On ne retombe sur la somme des lignes
+  // (bruitée) que si un total imprimé manque vraiment.
+  const totalBL = bl.statedTotal != null ? bl.statedTotal : bl.sumLines;
+  const totalWP = wp.statedTotal != null ? wp.statedTotal : wp.sumLines;
   const ecart = totalWP - totalBL;
+  // Part de l'écart que les lignes lues expliquent (quantité + prix) ; le solde
+  // "reste" = ce qui n'est pas expliqué par les lignes → une ligne mal lue à retrouver.
+  const reste = ecart - (partQte + partPrix);
   const r2 = (n) => Math.round(n * 100) / 100;
+
+  // LISTE UNIFIÉE des lignes qui DIFFÈRENT (le seul truc qui intéresse l'équipe),
+  // triée par impact décroissant. impact = montant Reçu − montant BL pour la ligne.
+  const diffs = rows
+    .filter((r) => !r.inBL || !r.inWP || Math.abs(r.montantWP - r.montantBL) >= 0.005 || r.qteBL !== r.qteWP)
+    .map((r) => {
+      const impact = r.montantWP - r.montantBL;
+      let reason, kind;
+      if (!r.inWP) {
+        reason = "Sur le BL, absent de la réception";
+        kind = "blonly";
+      } else if (!r.inBL) {
+        reason = "Reçu, absent du BL";
+        kind = "wponly";
+      } else {
+        const dq = r.qteBL !== r.qteWP;
+        const dp = r2(r.puBL) !== r2(r.puWP);
+        reason = dq && dp ? "Écart quantité + prix" : dq ? "Écart de quantité" : dp ? "Écart de prix" : "Écart de montant";
+        kind = dp && !dq ? "price" : "qty";
+      }
+      return { ...r, impact, reason, kind };
+    })
+    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact));
+
   return {
     totalBL,
     totalWP,
     ecart,
     partQte,
     partPrix,
-    concordance: Math.abs(ecart) < 0.01,
+    reste,
+    diffs,
+    concordance: Math.abs(ecart) < 0.05,
     pricesMissing: totalBL === 0 && totalWP === 0,
     qtyEcarts: rows.filter((r) => r.inBL && r.inWP && r.qteBL !== r.qteWP),
     priceEcarts: rows.filter((r) => r.inBL && r.inWP && r2(r.puBL) !== r2(r.puWP)),
@@ -336,7 +427,6 @@ export default function Page() {
   const [wpDocs, setWpDocs] = useState(null);
   const [password, setPassword] = useState("");
   const [needPassword, setNeedPassword] = useState(false);
-  const [notice, setNotice] = useState("");
 
   const addFiles = (side, list) => {
     const arr = Array.from(list).filter(
@@ -353,10 +443,8 @@ export default function Page() {
     setError("");
     setResult(null);
     setTruncated(false);
-    setNotice("");
     setStatus("reading");
     try {
-      let failed = 0;
       const blDocs = [];
       for (let i = 0; i < blFiles.length; i++) {
         const part = blFiles.length > 1 ? ` (${i + 1}/${blFiles.length})` : "";
@@ -367,8 +455,7 @@ export default function Page() {
               : `Lecture des BL CERP${part}`
           )
         );
-        blDocs.push(...got.docs);
-        failed += got.failures.length;
+        blDocs.push(...got);
       }
       const wpDocs = [];
       for (let i = 0; i < wpFiles.length; i++) {
@@ -380,8 +467,7 @@ export default function Page() {
               : `Lecture de la réception Winpharma${part}`
           )
         );
-        wpDocs.push(...got.docs);
-        failed += got.failures.length;
+        wpDocs.push(...got);
       }
       setProgress("Comparaison…");
       setBlDocs(blDocs);
@@ -391,11 +477,6 @@ export default function Page() {
       setExtractions({ bl: blAgg, wp: wpAgg });
       setTruncated([...blDocs, ...wpDocs].some((d) => d._repaired));
       setResult(reconcile(blAgg, wpAgg));
-      setNotice(
-        failed > 0
-          ? `${failed} paquet(s) (≈${failed * 2} pages) n'ont pas pu être lus, même après plusieurs essais. Le résultat ci-dessous est PARTIEL : rescannez ces pages (plus net / niveaux de gris) et relancez.`
-          : ""
-      );
       const mismatch =
         (blAgg.statedTotal != null &&
           Math.abs(blAgg.statedTotal - blAgg.sumLines) >= 0.02) ||
@@ -422,7 +503,6 @@ export default function Page() {
     setExtractions(null);
     setError("");
     setTruncated(false);
-    setNotice("");
     setBlDocs(null);
     setWpDocs(null);
     setShowDetail(false);
@@ -456,79 +536,6 @@ export default function Page() {
 
   const canRun = blFiles.length > 0 && wpFiles.length > 0 && status !== "reading";
 
-  const issues = result
-    ? [
-        {
-          key: "qty",
-          title: "Écarts de quantité",
-          action:
-            "Manque livré → réclamer un avoir à CERP. Surplus reçu → vérifier et signaler.",
-          impact: result.qtyEcarts.reduce(
-            (s, r) => s + Math.abs((r.qteWP - r.qteBL) * (r.puBL || r.puWP)),
-            0
-          ),
-          rows: result.qtyEcarts,
-          cols: [
-            ["Produit", (r) => r.designation, "left"],
-            ["Code", (r) => r.code || "—", "left mono"],
-            ["Qté BL", (r) => qty(r.qteBL), "num"],
-            ["Qté reçue", (r) => qty(r.qteWP), "num"],
-            ["Écart", (r) => qty(r.qteWP - r.qteBL), "num strong"],
-            ["Impact €", (r) => eur((r.qteWP - r.qteBL) * (r.puBL || r.puWP)), "num"],
-          ],
-        },
-        {
-          key: "price",
-          title: "Écarts de prix",
-          action:
-            "Prix facturé ≠ prix attendu → corriger le tarif / la remise dans Winpharma. Sinon ça se répète à chaque commande.",
-          impact: result.priceEcarts.reduce(
-            (s, r) => s + Math.abs(r.qteWP * (r.puWP - r.puBL)),
-            0
-          ),
-          rows: result.priceEcarts,
-          cols: [
-            ["Produit", (r) => r.designation, "left"],
-            ["Code", (r) => r.code || "—", "left mono"],
-            ["Prix BL", (r) => eur(r.puBL), "num"],
-            ["Prix Winpharma", (r) => eur(r.puWP), "num"],
-            ["Écart unit.", (r) => eur(r.puWP - r.puBL), "num strong"],
-            ["Impact €", (r) => eur(r.qteWP * (r.puWP - r.puBL)), "num"],
-          ],
-        },
-        {
-          key: "blonly",
-          title: "Présent au BL, absent de la réception",
-          action:
-            "Sur le BL mais pas enregistré reçu → vérifier physiquement ; réclamer à CERP si non livré.",
-          impact: result.blOnly.reduce((s, r) => s + Math.abs(r.montantBL), 0),
-          rows: result.blOnly,
-          cols: [
-            ["Produit", (r) => r.designation, "left"],
-            ["Code", (r) => r.code || "—", "left mono"],
-            ["Qté BL", (r) => qty(r.qteBL), "num"],
-            ["Montant BL", (r) => eur(r.montantBL), "num strong"],
-          ],
-        },
-        {
-          key: "wponly",
-          title: "Reçu mais absent du BL",
-          action:
-            "Reçu sans BL → vérifier le colis. Présent = un BL à scanner. Absent = corriger la réception dans Winpharma.",
-          impact: result.wpOnly.reduce((s, r) => s + Math.abs(r.montantWP), 0),
-          rows: result.wpOnly,
-          cols: [
-            ["Produit", (r) => r.designation, "left"],
-            ["Code", (r) => r.code || "—", "left mono"],
-            ["Qté reçue", (r) => qty(r.qteWP), "num"],
-            ["Montant", (r) => eur(r.montantWP), "num strong"],
-          ],
-        },
-      ]
-        .filter((i) => i.rows.length > 0)
-        .sort((a, b) => b.impact - a.impact)
-    : [];
-
   return (
     <div className="rcp-root">
       <style>{CSS}</style>
@@ -537,8 +544,8 @@ export default function Page() {
         <div className="rcp-eyebrow">Contrôle réception · officine</div>
         <h1 className="rcp-title">BL CERP&nbsp;↔&nbsp;Réception Winpharma</h1>
         <p className="rcp-sub">
-          Déposez les bons de livraison CERP et l'état de réception Winpharma. L'outil compare les
-          montants ; en cas d'écart, il trouve les lignes qui l'expliquent.
+          Déposez le bon de livraison CERP et la réception Winpharma. L'outil sort directement
+          les lignes qui diffèrent — classées par montant.
         </p>
       </header>
 
@@ -600,94 +607,104 @@ export default function Page() {
 
       {result && (
         <div className="rcp-result">
-          {result.pricesMissing ? (
-            <div className="rcp-verdict warn" role="status">
-              <span className="rcp-verdict-icon" aria-hidden="true">!</span>
-              <div className="rcp-verdict-body">
-                <div className="rcp-verdict-main">Prix non détectés</div>
-                <div className="rcp-verdict-sub">
-                  Impossible de comparer les montants. Vérifiez que les scans montrent les prix, ou
-                  regardez les quantités dans le détail ci-dessous.
-                </div>
-              </div>
-            </div>
-          ) : result.concordance ? (
-            <div className="rcp-verdict ok" role="status">
-              <span className="rcp-verdict-icon" aria-hidden="true">✓</span>
-              <div className="rcp-verdict-body">
-                <div className="rcp-verdict-main">Les montants concordent</div>
-                <div className="rcp-verdict-sub">
-                  Rien à faire. Total BL <b className="num">{eur(result.totalBL)}</b> · Reçu Winpharma{" "}
-                  <b className="num">{eur(result.totalWP)}</b>
+          {result.concordance && !result.pricesMissing ? (
+            <div className="rcp-allgood" role="status">
+              <span className="rcp-allgood-icon" aria-hidden="true">✓</span>
+              <div>
+                <div className="rcp-allgood-main">Aucun écart</div>
+                <div className="rcp-allgood-sub">
+                  BL <b className="num">{eur(result.totalBL)}</b> = Reçu{" "}
+                  <b className="num">{eur(result.totalWP)}</b>. Rien à traiter.
                 </div>
               </div>
             </div>
           ) : (
-            <div className="rcp-verdict bad" role="status">
-              <span className="rcp-verdict-icon" aria-hidden="true">✗</span>
-              <div className="rcp-verdict-body">
-                <div className="rcp-verdict-label">Écart à traiter</div>
-                <div className="rcp-verdict-amount num">{eur(Math.abs(result.ecart))}</div>
-                <div className="rcp-verdict-sub">
-                  Total BL <b className="num">{eur(result.totalBL)}</b> · Reçu Winpharma{" "}
-                  <b className="num">{eur(result.totalWP)}</b>
-                  {" — "}
-                  {result.ecart > 0
-                    ? "Winpharma supérieur (ce n'est pas un manquant CERP)"
-                    : "BL supérieur (manque côté reçu)"}
+            <>
+              <div className="rcp-summary" role="status">
+                <div className="rcp-summary-top">
+                  <span className="rcp-summary-label">Écart</span>
+                  <span className="rcp-summary-amount num">{eur(Math.abs(result.ecart))}</span>
                 </div>
-                <div className="rcp-chips">
-                  <span className="rcp-chip">
-                    dont quantité <b className="num">{eur(result.partQte)}</b>
-                  </span>
-                  <span className="rcp-chip">
-                    dont prix <b className="num">{eur(result.partPrix)}</b>
-                  </span>
+                <div className="rcp-summary-sub">
+                  BL <b className="num">{eur(result.totalBL)}</b> · Reçu{" "}
+                  <b className="num">{eur(result.totalWP)}</b> ·{" "}
+                  <b>{result.diffs.length}</b> ligne{result.diffs.length > 1 ? "s" : ""} à vérifier
+                  {Math.abs(result.reste) >= 0.05 && (
+                    <>
+                      {" · "}
+                      <span className="rcp-summary-reste">
+                        {eur(Math.abs(result.reste))} non expliqué (lecture à revoir)
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
-            </div>
-          )}
 
-          {notice && (
-            <div className="rcp-integrity" role="alert">
-              ⚠ {notice}
-            </div>
-          )}
+              {(result.pricesMissing || truncated) && (
+                <div className="rcp-note" role="alert">
+                  {result.pricesMissing
+                    ? "Prix non détectés sur les scans — la comparaison des montants n'est pas fiable. Vérifiez que les bons montrent bien les prix."
+                    : "Un document était trop long : la lecture a pu être tronquée. Vérifiez le détail avant de conclure."}
+                </div>
+              )}
 
-          {truncated && (
-            <div className="rcp-integrity" role="alert">
-              ⚠ Un document était trop long : la lecture a été tronquée et des lignes ont pu être
-              perdues. Le total peut être incomplet — vérifiez le détail, ou scannez le BL en deux
-              fichiers et relancez.
-            </div>
-          )}
+              {result.diffs.length === 0 ? (
+                <div className="rcp-note">
+                  Les totaux diffèrent mais aucune ligne précise ne ressort : une ligne est sûrement
+                  mal lue. Ouvrez le détail pour corriger à la main.
+                </div>
+              ) : (
+                <div className="rcp-difflist">
+                  {result.diffs.map((d, i) => (
+                    <div className={"rcp-diff " + d.kind} key={i}>
+                      <div className="rcp-diff-body">
+                        <div className="rcp-diff-name">{d.designation}</div>
+                        <div className="rcp-diff-meta">
+                          <span className={"rcp-diff-tag " + d.kind}>{d.reason}</span>
+                          {d.code && <span className="rcp-diff-code mono">{d.code}</span>}
+                        </div>
+                        <div className="rcp-diff-cmp">
+                          <span>
+                            BL&nbsp;:{" "}
+                            <b>
+                              {d.inBL
+                                ? qty(d.qteBL) + " × " + eur(d.puBL) + " = " + eur(d.montantBL)
+                                : "—"}
+                            </b>
+                          </span>
+                          <span>
+                            Reçu&nbsp;:{" "}
+                            <b>
+                              {d.inWP
+                                ? qty(d.qteWP) + " × " + eur(d.puWP) + " = " + eur(d.montantWP)
+                                : "—"}
+                            </b>
+                          </span>
+                        </div>
+                      </div>
+                      <div className="rcp-diff-impact num">
+                        {(d.impact > 0 ? "+" : "") + eur(d.impact)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
 
-          <IntegrityCheck side="BL CERP" agg={extractions.bl} />
-          <IntegrityCheck side="Réception Winpharma" agg={extractions.wp} />
-
-          {issues.length > 0 && (
-            <div className="rcp-section-head">À traiter — classé par impact</div>
+              <div className="rcp-foot-note">
+                Une ligne « sur le BL, absent de la réception » peut être un appro hors-commande
+                (à ignorer). Vérifiez toujours avant de réclamer.
+              </div>
+            </>
           )}
-          {issues.map((iss) => (
-            <EcartTable
-              key={iss.key}
-              title={iss.title}
-              action={iss.action}
-              impact={iss.impact}
-              rows={iss.rows}
-              cols={iss.cols}
-            />
-          ))}
 
           <button className="rcp-detail-toggle" onClick={() => setShowDetail((s) => !s)}>
-            {showDetail ? "Masquer" : "Voir"} le détail des lignes lues
+            {showDetail ? "Masquer" : "Voir / corriger"} le détail complet
           </button>
           {showDetail && blDocs && wpDocs && (
             <div className="rcp-detail">
               <p className="rcp-edit-hint">
                 Une valeur mal lue ? Clique le chiffre, tape le bon (la virgule marche), sors du
-                champ : le total et la comparaison se recalculent. Vise « lignes = total » sur
-                chaque document.
+                champ : la comparaison se recalcule.
               </p>
               <EditableDetail side="bl" label="BL CERP" docs={blDocs} onEdit={editLine} />
               <EditableDetail
@@ -1033,4 +1050,48 @@ const CSS = `
 .rcp-tag{font-size:11px; font-weight:600; color:var(--warn); background:var(--warn-soft); border-radius:6px; padding:2px 7px; margin-left:8px;}
 
 .rcp-foot{max-width:880px; margin:28px auto 0; font-size:12px; color:var(--muted); text-align:center;}
+
+/* --- Redesign : tout concorde --- */
+.rcp-allgood{max-width:880px; margin:0 auto; display:flex; align-items:center; gap:16px; background:var(--ok-soft); border:1px solid #BFE3CB; border-radius:16px; padding:22px 24px;}
+.rcp-allgood-icon{flex:none; width:40px; height:40px; border-radius:50%; background:var(--ok); color:#fff; display:flex; align-items:center; justify-content:center; font-size:22px; font-weight:800;}
+.rcp-allgood-main{font-size:22px; font-weight:700; color:var(--ok); letter-spacing:-.02em;}
+.rcp-allgood-sub{margin-top:3px; font-size:14px; color:var(--ink);}
+
+/* --- Redesign : résumé minimal --- */
+.rcp-summary{max-width:880px; margin:0 auto 16px; background:var(--card); border:1px solid var(--line); border-left:5px solid var(--bad); border-radius:14px; padding:16px 20px;}
+.rcp-summary-top{display:flex; align-items:baseline; gap:12px;}
+.rcp-summary-label{font-size:12px; letter-spacing:.1em; text-transform:uppercase; font-weight:700; color:var(--bad);}
+.rcp-summary-amount{font-size:clamp(26px,5vw,36px); font-weight:800; letter-spacing:-.03em; color:var(--bad); line-height:1;}
+.rcp-summary-sub{margin-top:8px; font-size:14px; color:var(--muted);}
+.rcp-summary-sub b{color:var(--ink);}
+.rcp-summary-reste{color:var(--warn); font-weight:600;}
+
+.rcp-note{max-width:880px; margin:0 auto 16px; background:var(--warn-soft); border:1px solid #EAD2AE; color:var(--warn); border-radius:12px; padding:12px 16px; font-size:13.5px; line-height:1.45;}
+
+/* --- Redesign : liste des différences --- */
+.rcp-difflist{max-width:880px; margin:0 auto; display:flex; flex-direction:column; gap:10px;}
+.rcp-diff{display:flex; align-items:flex-start; gap:14px; background:var(--card); border:1px solid var(--line); border-left:4px solid var(--muted); border-radius:12px; padding:14px 16px;}
+.rcp-diff.blonly{border-left-color:var(--bad);}
+.rcp-diff.wponly{border-left-color:var(--brand);}
+.rcp-diff.qty{border-left-color:var(--warn);}
+.rcp-diff.price{border-left-color:#7C3AED;}
+.rcp-diff-body{flex:1; min-width:0;}
+.rcp-diff-name{font-size:15.5px; font-weight:650; letter-spacing:-.01em; line-height:1.25;}
+.rcp-diff-meta{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:6px 0;}
+.rcp-diff-tag{font-size:11.5px; font-weight:700; padding:3px 9px; border-radius:999px; text-transform:uppercase; letter-spacing:.03em; white-space:nowrap;}
+.rcp-diff-tag.blonly{background:var(--bad-soft); color:var(--bad);}
+.rcp-diff-tag.wponly{background:var(--brand-soft); color:var(--brand);}
+.rcp-diff-tag.qty{background:var(--warn-soft); color:var(--warn);}
+.rcp-diff-tag.price{background:#F0EAFB; color:#6D28D9;}
+.rcp-diff-code{font-size:12px; color:var(--muted);}
+.rcp-diff-cmp{display:flex; flex-wrap:wrap; gap:6px 22px; font-size:13px; color:var(--muted);}
+.rcp-diff-cmp b{color:var(--ink); font-variant-numeric:tabular-nums;}
+.rcp-diff-impact{flex:none; font-size:18px; font-weight:800; letter-spacing:-.02em; color:var(--bad); white-space:nowrap; padding-top:1px;}
+
+.rcp-foot-note{max-width:880px; margin:14px auto 0; font-size:12.5px; color:var(--muted); line-height:1.45;}
+
+@media(max-width:560px){
+  .rcp-diff{flex-direction:column; gap:8px;}
+  .rcp-diff-impact{align-self:flex-end;}
+}
 `;
