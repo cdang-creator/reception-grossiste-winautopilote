@@ -270,6 +270,14 @@ async function extractFile(file, password, onChunk) {
 
 const num = (x) => (typeof x === "number" && isFinite(x) ? x : 0);
 const normCode = (c) => (c == null ? "" : String(c).replace(/\D/g, ""));
+/* Clé d'appariement robuste : un CIP13 français = "34009" + CIP7 (7 chiffres uniques) + clé.
+   On apparie sur le CIP7, donc "3400930273876" et "3027387" (tronqué) tombent sur la même clé.
+   Les autres codes (EAN 13 commençant autrement, etc.) sont gardés entiers. */
+const canonCode = (c) => {
+  const d = normCode(c);
+  if (d.length === 13 && d.startsWith("34009")) return d.slice(5, 12); // CIP7
+  return d; // CIP7 déjà nu, ou EAN/autre code complet
+};
 const eur = (n) =>
   (Math.round(n * 100) / 100).toLocaleString("fr-FR", {
     minimumFractionDigits: 2,
@@ -303,7 +311,7 @@ function aggregate(docs) {
     }
     for (const l of d.lignes || []) {
       const code = normCode(l.code);
-      const key = code || "DES:" + String(l.designation || "").trim().toLowerCase();
+      const key = canonCode(l.code) || "DES:" + String(l.designation || "").trim().toLowerCase();
       const prev = map.get(key) || {
         code,
         designation: l.designation || "",
