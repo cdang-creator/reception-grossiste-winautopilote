@@ -739,7 +739,10 @@ export default function Page() {
         );
       })()}
 
-      <footer className="rcp-foot">Contrôle de première passe — vérifiez le détail avant toute réclamation.</footer>
+      <footer className="rcp-foot">
+        Contrôle de première passe — vérifiez le détail avant toute réclamation.{" "}
+        <span className="rcp-ver">version&nbsp;7 · 18/06</span>
+      </footer>
     </div>
   );
 }
@@ -1104,6 +1107,7 @@ const CSS = `
 .rcp-tag{font-size:11px; font-weight:600; color:var(--warn); background:var(--warn-soft); border-radius:6px; padding:2px 7px; margin-left:8px;}
 
 .rcp-foot{max-width:880px; margin:28px auto 0; font-size:12px; color:var(--muted); text-align:center;}
+.rcp-ver{display:inline-block; margin-left:6px; padding:1px 8px; border:1px solid var(--line); border-radius:999px; font-variant-numeric:tabular-nums; color:var(--muted);}
 
 /* --- Redesign : tout concorde --- */
 .rcp-allgood{max-width:880px; margin:0 auto; display:flex; align-items:center; gap:16px; background:var(--ok-soft); border:1px solid #BFE3CB; border-radius:16px; padding:22px 24px;}
