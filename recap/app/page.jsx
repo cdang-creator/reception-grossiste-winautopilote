@@ -278,6 +278,30 @@ const canonCode = (c) => {
   if (d.length === 13 && d.startsWith("34009")) return d.slice(5, 12); // CIP7
   return d; // CIP7 déjà nu, ou EAN/autre code complet
 };
+
+/* Distance d'édition (Levenshtein) entre deux codes, pour détecter un chiffre
+   mal lu ou sauté au scan. Plafonnée : au-delà de 3 d'écart de longueur, on coupe. */
+function editDist(a, b) {
+  a = normCode(a);
+  b = normCode(b);
+  if (!a || !b) return 99;
+  if (Math.abs(a.length - b.length) > 2) return 99;
+  const m = a.length,
+    n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
 const eur = (n) =>
   (Math.round(n * 100) / 100).toLocaleString("fr-FR", {
     minimumFractionDigits: 2,
@@ -399,6 +423,36 @@ function reconcile(bl, wp) {
       return { ...r, impact, reason, kind };
     })
     .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact));
+
+  /* Neutralisation : une fausse paire = deux lignes +X / -X dont les codes ne
+     diffèrent que d'1-2 chiffres (même produit, code mal lu sur un scan).
+     On les marque "neutral" pour les sortir des écarts à traiter. Les écarts à
+     0 € (qté/prix répartis autrement, même montant) sont aussi neutralisés. */
+  diffs.forEach((d) => {
+    d.neutral = false;
+    d.reasonNeutral = null;
+  });
+  diffs.forEach((d) => {
+    if (!d.neutral && Math.abs(d.impact) < 0.005) {
+      d.neutral = true;
+      d.reasonNeutral = "Même montant des deux côtés — sans impact";
+    }
+  });
+  for (let i = 0; i < diffs.length; i++) {
+    if (diffs[i].neutral) continue;
+    for (let j = i + 1; j < diffs.length; j++) {
+      if (diffs[j].neutral) continue;
+      if (
+        Math.abs(diffs[i].impact + diffs[j].impact) < 0.01 &&
+        editDist(diffs[i].code, diffs[j].code) <= 2
+      ) {
+        diffs[i].neutral = diffs[j].neutral = true;
+        diffs[i].reasonNeutral = diffs[j].reasonNeutral =
+          "Même produit des deux côtés, code lu différemment — sans impact";
+        break;
+      }
+    }
+  }
 
   return {
     totalBL,
@@ -614,14 +668,12 @@ export default function Page() {
       )}
 
       {result && (() => {
-        const ecarts = result.diffs.filter(
-          (d) => d.kind === "qty" || d.kind === "price" || d.kind === "blonly"
-        );
-        const recuSansBon = result.diffs.filter((d) => d.kind === "wponly");
-        const aucunEcart = ecarts.length === 0 && recuSansBon.length === 0;
-        const sumEcarts = ecarts.reduce((s, d) => s + d.impact, 0);
+        const aTraiter = result.diffs.filter((d) => !d.neutral && d.kind !== "wponly");
+        const recuSansBon = result.diffs.filter((d) => !d.neutral && d.kind === "wponly");
+        const neutralises = result.diffs.filter((d) => d.neutral);
+        const aucunEcart = aTraiter.length === 0 && recuSansBon.length === 0;
+        const sumEcarts = aTraiter.reduce((s, d) => s + d.impact, 0);
         const sumRecu = recuSansBon.reduce((s, d) => s + d.impact, 0);
-        const nLignes = ecarts.length + recuSansBon.length;
         const justifie = Math.abs(result.reste) < 0.05;
         return (
           <div className="rcp-result">
@@ -630,7 +682,7 @@ export default function Page() {
                 <div className="rcp-allgood" role="status">
                   <span className="rcp-allgood-icon" aria-hidden="true">✓</span>
                   <div>
-                    <div className="rcp-allgood-main">Aucun écart</div>
+                    <div className="rcp-allgood-main">Aucun écart à traiter</div>
                     <div className="rcp-allgood-sub">
                       BL <b className="num">{eur(result.totalBL)}</b> = Reçu{" "}
                       <b className="num">{eur(result.totalWP)}</b>. Rien à traiter.
@@ -645,14 +697,14 @@ export default function Page() {
               )
             ) : (
               <>
-                <div className={"rcp-status " + (ecarts.length ? "bad" : "ok")} role="status">
+                <div className={"rcp-status " + (aTraiter.length ? "bad" : "ok")} role="status">
                   <span className="rcp-status-icon" aria-hidden="true">
-                    {ecarts.length ? "!" : "✓"}
+                    {aTraiter.length ? "!" : "✓"}
                   </span>
                   <div className="rcp-status-body">
                     <div className="rcp-status-main">
-                      {ecarts.length > 0
-                        ? `${ecarts.length} écart${ecarts.length > 1 ? "s" : ""} à traiter`
+                      {aTraiter.length > 0
+                        ? `${aTraiter.length} écart${aTraiter.length > 1 ? "s" : ""} à traiter`
                         : "Aucun écart à traiter"}
                     </div>
                     <div className="rcp-status-recon">
@@ -674,6 +726,12 @@ export default function Page() {
                           {recuSansBon.length} reçu{recuSansBon.length > 1 ? "s" : ""} sans bon
                         </>
                       )}
+                      {neutralises.length > 0 && (
+                        <>
+                          {" · "}
+                          {neutralises.length} neutralisé{neutralises.length > 1 ? "s" : ""}
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -686,14 +744,16 @@ export default function Page() {
                   </div>
                 )}
 
-                {ecarts.length > 0 && (
+                {aTraiter.length > 0 && (
                   <>
                     <div className="rcp-group-head">
-                      <span>À traiter — {ecarts.length} écart{ecarts.length > 1 ? "s" : ""}</span>
+                      <span>
+                        À traiter — {aTraiter.length} écart{aTraiter.length > 1 ? "s" : ""}
+                      </span>
                       <span className="num">{(sumEcarts > 0 ? "+" : "") + eur(sumEcarts)}</span>
                     </div>
                     <div className="rcp-difflist">
-                      {ecarts.map((d, i) => (
+                      {aTraiter.map((d, i) => (
                         <DiffCard d={d} key={"e" + i} />
                       ))}
                     </div>
@@ -715,6 +775,21 @@ export default function Page() {
                   </details>
                 )}
               </>
+            )}
+
+            {neutralises.length > 0 && (
+              <details className="rcp-onesided rcp-neutral">
+                <summary>
+                  {neutralises.length} différence{neutralises.length > 1 ? "s" : ""} neutralisée
+                  {neutralises.length > 1 ? "s" : ""} — même produit des deux côtés (code lu
+                  différemment) ou montant identique, sans impact
+                </summary>
+                <div className="rcp-difflist">
+                  {neutralises.map((d, i) => (
+                    <DiffCard d={d} key={"n" + i} />
+                  ))}
+                </div>
+              </details>
             )}
 
             <button className="rcp-detail-toggle" onClick={() => setShowDetail((s) => !s)}>
@@ -741,7 +816,7 @@ export default function Page() {
 
       <footer className="rcp-foot">
         Contrôle de première passe — vérifiez le détail avant toute réclamation.{" "}
-        <span className="rcp-ver">version&nbsp;7 · 18/06</span>
+        <span className="rcp-ver">version&nbsp;8 · 18/06</span>
       </footer>
     </div>
   );
@@ -777,7 +852,11 @@ function DiffCard({ d }) {
             <b>{d.inWP ? qty(d.qteWP) + " × " + eur(d.puWP) + " = " + eur(d.montantWP) : "—"}</b>
           </span>
         </div>
-        {ACTIONS[d.kind] && <div className="rcp-diff-action">→ {ACTIONS[d.kind]}</div>}
+        {d.neutral ? (
+          <div className="rcp-diff-neutral">✓ Neutralisé — {d.reasonNeutral}</div>
+        ) : (
+          ACTIONS[d.kind] && <div className="rcp-diff-action">→ {ACTIONS[d.kind]}</div>
+        )}
       </div>
       <div className="rcp-diff-impact num">{(d.impact > 0 ? "+" : "") + eur(d.impact)}</div>
     </div>
@@ -1135,6 +1214,9 @@ const CSS = `
 .rcp-ok-text{color:var(--ok); font-weight:600;}
 
 .rcp-diff-action{margin-top:7px; font-size:12.5px; font-weight:600; color:var(--brand);}
+.rcp-diff-neutral{margin-top:7px; font-size:12px; color:var(--muted); font-style:italic;}
+.rcp-neutral .rcp-diff{opacity:.7; border-left-color:var(--line);}
+.rcp-neutral .rcp-diff-impact{color:var(--muted);}
 .rcp-summary-top{display:flex; align-items:baseline; gap:12px;}
 .rcp-summary-label{font-size:12px; letter-spacing:.1em; text-transform:uppercase; font-weight:700; color:var(--bad);}
 .rcp-summary-amount{font-size:clamp(26px,5vw,36px); font-weight:800; letter-spacing:-.03em; color:var(--bad); line-height:1;}
