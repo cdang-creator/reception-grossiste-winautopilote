@@ -668,12 +668,10 @@ export default function Page() {
       )}
 
       {result && (() => {
-        const aTraiter = result.diffs.filter((d) => !d.neutral && d.kind !== "wponly");
-        const recuSansBon = result.diffs.filter((d) => !d.neutral && d.kind === "wponly");
+        const aTraiter = result.diffs.filter((d) => !d.neutral);
         const neutralises = result.diffs.filter((d) => d.neutral);
-        const aucunEcart = aTraiter.length === 0 && recuSansBon.length === 0;
+        const aucunEcart = aTraiter.length === 0;
         const sumEcarts = aTraiter.reduce((s, d) => s + d.impact, 0);
-        const sumRecu = recuSansBon.reduce((s, d) => s + d.impact, 0);
         const justifie = Math.abs(result.reste) < 0.05;
         return (
           <div className="rcp-result">
@@ -720,12 +718,6 @@ export default function Page() {
                     <div className="rcp-status-totals">
                       BL <b className="num">{eur(result.totalBL)}</b> · Reçu{" "}
                       <b className="num">{eur(result.totalWP)}</b>
-                      {recuSansBon.length > 0 && (
-                        <>
-                          {" · "}
-                          {recuSansBon.length} reçu{recuSansBon.length > 1 ? "s" : ""} sans bon
-                        </>
-                      )}
                       {neutralises.length > 0 && (
                         <>
                           {" · "}
@@ -758,21 +750,6 @@ export default function Page() {
                       ))}
                     </div>
                   </>
-                )}
-
-                {recuSansBon.length > 0 && (
-                  <details className="rcp-onesided">
-                    <summary>
-                      {recuSansBon.length} reçu{recuSansBon.length > 1 ? "s" : ""} sans bon de
-                      livraison ({(sumRecu > 0 ? "+" : "") + eur(sumRecu)}) — bon probablement non
-                      scanné
-                    </summary>
-                    <div className="rcp-difflist">
-                      {recuSansBon.map((d, i) => (
-                        <DiffCard d={d} key={"o" + i} />
-                      ))}
-                    </div>
-                  </details>
                 )}
               </>
             )}
@@ -816,7 +793,7 @@ export default function Page() {
 
       <footer className="rcp-foot">
         Contrôle de première passe — vérifiez le détail avant toute réclamation.{" "}
-        <span className="rcp-ver">version&nbsp;8 · 18/06</span>
+        <span className="rcp-ver">version&nbsp;9 · 18/06</span>
       </footer>
     </div>
   );
